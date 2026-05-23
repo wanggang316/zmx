@@ -175,6 +175,64 @@ pub fn main() !void {
         };
         std.log.info("socket path={s}", .{daemon.socket_path});
         return attach(&daemon);
+    } else if (std.mem.eql(u8, cmd, "serve")) {
+        const session_name = args.next() orelse "";
+        if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
+            return help();
+        }
+        if (session_name.len == 0) return error.SessionNameRequired;
+
+        var serve_cwd: ?[]const u8 = null;
+        var restore_from: ?[]const u8 = null;
+        var command_args: std.ArrayList([]const u8) = .empty;
+        defer command_args.deinit(alloc);
+        while (args.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+                return help();
+            } else if (std.mem.eql(u8, arg, "--cwd")) {
+                serve_cwd = args.next() orelse return error.MissingCwdValue;
+            } else if (std.mem.eql(u8, arg, "--restore-from")) {
+                restore_from = args.next() orelse return error.MissingRestoreFromValue;
+            } else if (std.mem.eql(u8, arg, "--command")) {
+                while (args.next()) |c| {
+                    try command_args.append(alloc, c);
+                }
+            } else {
+                try command_args.append(alloc, arg);
+            }
+        }
+
+        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cwd = if (serve_cwd) |c| c else std.posix.getcwd(&cwd_buf) catch "";
+
+        var command: ?[][]const u8 = null;
+        if (command_args.items.len > 0) {
+            command = command_args.items;
+        }
+
+        const clients = try std.ArrayList(*Client).initCapacity(alloc, 10);
+        const sesh = try socket.getSeshName(alloc, session_name);
+        defer alloc.free(sesh);
+        var daemon = Daemon{
+            .running = true,
+            .cfg = &cfg,
+            .alloc = alloc,
+            .clients = clients,
+            .session_name = sesh,
+            .socket_path = undefined,
+            .pid = undefined,
+            .command = command,
+            .cwd = cwd,
+            .created_at = @intCast(std.time.timestamp()),
+            .leader_client_fd = null,
+            .restore_from = restore_from,
+        };
+        daemon.socket_path = socket.getSocketPath(alloc, cfg.socket_dir, sesh) catch |err| switch (err) {
+            error.NameTooLong => return socket.printSessionNameTooLong(sesh, cfg.socket_dir),
+            error.OutOfMemory => return err,
+        };
+        std.log.info("socket path={s}", .{daemon.socket_path});
+        return serve(&daemon);
     } else if (std.mem.eql(u8, cmd, "run") or std.mem.eql(u8, cmd, "r")) {
         const session_name = args.next() orelse "";
         if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
@@ -597,6 +655,10 @@ const Daemon = struct {
     is_fish: bool = false, // true if session shell is fish (affects exit code variable)
     pty_fd: i32 = -1, // set by daemonLoop so handleRun can probe the foreground process
     pty_write_buf: std.ArrayList(u8) = .empty,
+    // Optional path to a serializeTerminalState snapshot. When set, the
+    // daemon feeds it into the VT mirror before entering the poll loop so
+    // restored screen contents are visible before the shell's first echo.
+    restore_from: ?[]const u8 = null,
 
     const EnsureSessionResult = struct {
         created: bool,
@@ -1184,6 +1246,60 @@ const Daemon = struct {
         }
     }
 
+    /// handleSnapshot serializes the daemon's terminal mirror to
+    /// `<socket_dir>/snapshots/<session>.snap` via an atomic rename, sends
+    /// SIGHUP to the shell's process group, and shuts the daemon down.
+    /// Used by a supervising parent to capture restorable state before
+    /// retiring a pane's sidecar.
+    pub fn handleSnapshot(self: *Daemon, term: *ghostty_vt.Terminal) !void {
+        std.log.info("snapshot requested session={s}", .{self.session_name});
+
+        const snap_dir = try std.fmt.allocPrint(
+            self.alloc,
+            "{s}/snapshots",
+            .{self.cfg.socket_dir},
+        );
+        defer self.alloc.free(snap_dir);
+        posix.mkdirat(posix.AT.FDCWD, snap_dir, @intCast(self.cfg.dir_mode)) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+
+        const snap_path = try std.fmt.allocPrint(
+            self.alloc,
+            "{s}/{s}.snap",
+            .{ snap_dir, self.session_name },
+        );
+        defer self.alloc.free(snap_path);
+
+        const tmp_path = try std.fmt.allocPrint(
+            self.alloc,
+            "{s}.tmp",
+            .{snap_path},
+        );
+        defer self.alloc.free(tmp_path);
+
+        const bytes = util.serializeTerminalState(self.alloc, term) orelse return error.SerializeFailed;
+        defer self.alloc.free(bytes);
+
+        // Write to a sibling temp file, then rename(2) to publish atomically.
+        // A reader either sees the previous snapshot or the new one, never a
+        // half-written file.
+        {
+            const f = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true, .mode = @intCast(self.cfg.log_mode) });
+            defer f.close();
+            try f.writeAll(bytes);
+        }
+        try std.fs.cwd().rename(tmp_path, snap_path);
+
+        // Best-effort: signal the shell process group so it gets a chance to
+        // run any HUP traps before the daemon tears the PTY down. If the
+        // shell is already gone, ignore the error.
+        posix.kill(-self.pid, posix.SIG.HUP) catch {};
+
+        self.shutdown();
+    }
+
     pub fn handleWrite(self: *Daemon, client: *Client, payload: []const u8) !void {
         // Wire format: [u32 path len][path bytes][file content]
         if (payload.len < @sizeOf(u32)) return error.InvalidPayload;
@@ -1261,6 +1377,8 @@ fn help() !void {
         \\
         \\Commands:
         \\  [a]ttach <name> [command...]             Attach to session, creating if needed
+        \\  serve <name> [--cwd <path>] [--restore-from <file>] [--command <prog> [args...]]
+        \\                                           Spawn daemon for <name>, print socket path, exit
         \\  [r]un <name> [-d] [command...]           Send command without attaching
         \\  [s]end <name> <text...>                  Send raw input to session PTY
         \\  [p]rint <name> <text...>                 Inject text into session display
@@ -2039,6 +2157,25 @@ fn attach(daemon: *Daemon) !void {
     }
 }
 
+/// serve spawns a daemon for the named session and exits in the parent
+/// process. Unlike `attach`, the caller is not connected to the PTY -- it
+/// only learns the socket path (printed to stdout) and may then interact
+/// with the daemon via separate IPC clients (e.g. `zmx send`, or a parent
+/// process speaking the wire protocol directly).
+fn serve(daemon: *Daemon) !void {
+    const result = try daemon.ensureSession();
+    // Daemon child path: daemonLoop has already exited by the time we get
+    // here, so cleanup is done and the process just returns.
+    if (result.is_daemon) return;
+
+    // Parent path: print socket path on a single line so a supervising
+    // process can read it back without parsing decoration.
+    var buf: [4096]u8 = undefined;
+    var w = std.fs.File.stdout().writer(&buf);
+    try w.interface.print("{s}\n", .{daemon.socket_path});
+    try w.interface.flush();
+}
+
 fn writeFile(daemon: *Daemon, file_path: []const u8) !void {
     var buf: [4096]u8 = undefined;
     var w = std.fs.File.stdout().writer(&buf);
@@ -2487,6 +2624,30 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
     var vt_stream = term.vtStream();
     defer vt_stream.deinit();
 
+    // Pre-fill the VT mirror from a snapshot file before any PTY bytes are
+    // read. Done here (not in spawnPty) because vt_stream isn't constructed
+    // until this point; ordering ensures the restored frame is layered
+    // beneath whatever the shell echoes on startup.
+    if (daemon.restore_from) |path| {
+        if (std.fs.cwd().openFile(path, .{})) |f| {
+            defer f.close();
+            // 16 MiB ceiling matches the existing max_scrollback envelope
+            // for serialized state; larger payloads almost certainly mean a
+            // corrupt or unrelated file.
+            if (f.readToEndAlloc(daemon.alloc, 16 * 1024 * 1024)) |bytes| {
+                defer daemon.alloc.free(bytes);
+                if (bytes.len > 0) {
+                    vt_stream.nextSlice(bytes);
+                    daemon.has_pty_output = true;
+                }
+            } else |err| {
+                std.log.warn("restore-from read failed path={s} err={s}", .{ path, @errorName(err) });
+            }
+        } else |err| {
+            std.log.warn("restore-from open failed path={s} err={s}", .{ path, @errorName(err) });
+        }
+    }
+
     daemon_loop: while (daemon.running) {
         poll_fds.clearRetainingCapacity();
 
@@ -2694,6 +2855,10 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                         .Run => try daemon.handleRun(client, msg.payload),
                         .Ack, .TaskComplete => {},
                         .Write => try daemon.handleWrite(client, msg.payload),
+                        .Snapshot => {
+                            try daemon.handleSnapshot(&term);
+                            break :daemon_loop;
+                        },
                         _ => std.log.warn(
                             "ignoring unknown IPC tag={d}",
                             .{@intFromEnum(msg.header.tag)},
