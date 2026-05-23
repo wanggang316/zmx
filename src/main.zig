@@ -663,6 +663,10 @@ const Daemon = struct {
     const EnsureSessionResult = struct {
         created: bool,
         is_daemon: bool,
+        /// PID of the daemon process when the parent forked one as part of
+        /// this call. Zero when the session already existed (the parent did
+        /// not fork) or when the caller is itself the daemon child.
+        daemon_pid: i32 = 0,
     };
 
     pub fn deinit(self: *Daemon) void {
@@ -926,7 +930,7 @@ const Daemon = struct {
             }
             posix.close(server_sock_fd);
             std.Thread.sleep(10 * std.time.ns_per_ms);
-            return .{ .created = true, .is_daemon = false };
+            return .{ .created = true, .is_daemon = false, .daemon_pid = pid };
         }
 
         return .{ .created = false, .is_daemon = false };
@@ -2168,11 +2172,14 @@ fn serve(daemon: *Daemon) !void {
     // here, so cleanup is done and the process just returns.
     if (result.is_daemon) return;
 
-    // Parent path: print socket path on a single line so a supervising
-    // process can read it back without parsing decoration.
+    // Parent path: emit two newline-terminated lines so a supervising
+    // process can read both the daemon's control socket and its PID back
+    // without parsing decoration. `daemon_pid` is zero when ensureSession
+    // attached to an already-running session (no fork happened) — the
+    // caller is expected to treat zero as "unknown".
     var buf: [4096]u8 = undefined;
     var w = std.fs.File.stdout().writer(&buf);
-    try w.interface.print("{s}\n", .{daemon.socket_path});
+    try w.interface.print("{s}\n{d}\n", .{ daemon.socket_path, result.daemon_pid });
     try w.interface.flush();
 }
 
