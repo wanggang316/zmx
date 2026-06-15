@@ -67,6 +67,35 @@ fn drainSignalPipe() void {
     }
 }
 
+/// Result of parsing the `attach` command's trailing arguments.
+const AttachArgs = struct {
+    /// Path to a serializeTerminalState snapshot, when `--restore-from <file>`
+    /// was supplied. Null means cold start.
+    restore_from: ?[]const u8 = null,
+    /// Everything else, collected verbatim to spawn as the session command.
+    command_args: std.ArrayList([]const u8) = .empty,
+};
+
+/// Parse the args that follow `attach <session>`, intercepting
+/// `--restore-from <file>` (mirroring the `serve` arm) so the flag and its
+/// value are consumed here and never leak into the spawned command. Every
+/// other token is collected into `command_args`.
+///
+/// Generic over the iterator type so unit tests can drive it with a
+/// slice-backed iterator instead of `std.process.ArgIterator`.
+fn parseAttachArgs(alloc: std.mem.Allocator, args: anytype) !AttachArgs {
+    var result: AttachArgs = .{};
+    errdefer result.command_args.deinit(alloc);
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--restore-from")) {
+            result.restore_from = args.next() orelse return error.MissingRestoreFromValue;
+        } else {
+            try result.command_args.append(alloc, arg);
+        }
+    }
+    return result;
+}
+
 pub fn main() !void {
     // use c_allocator to avoid "reached unreachable code" panic in DebugAllocator when forking
     const alloc = std.heap.c_allocator;
@@ -139,16 +168,13 @@ pub fn main() !void {
             return help();
         }
 
-        var command_args: std.ArrayList([]const u8) = .empty;
-        defer command_args.deinit(alloc);
-        while (args.next()) |arg| {
-            try command_args.append(alloc, arg);
-        }
+        var parsed = try parseAttachArgs(alloc, &args);
+        defer parsed.command_args.deinit(alloc);
 
         const clients = try std.ArrayList(*Client).initCapacity(alloc, 10);
         var command: ?[][]const u8 = null;
-        if (command_args.items.len > 0) {
-            command = command_args.items;
+        if (parsed.command_args.items.len > 0) {
+            command = parsed.command_args.items;
         }
 
         var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -168,6 +194,7 @@ pub fn main() !void {
             .cwd = cwd,
             .created_at = @intCast(std.time.timestamp()),
             .leader_client_fd = null,
+            .restore_from = parsed.restore_from,
         };
         daemon.socket_path = socket.getSocketPath(alloc, cfg.socket_dir, sesh) catch |err| switch (err) {
             error.NameTooLong => return socket.printSessionNameTooLong(sesh, cfg.socket_dir),
@@ -622,6 +649,59 @@ test "Cfg.init uses custom modes from env vars" {
 
     try std.testing.expectEqual(@as(u32, 0o770), cfg.dir_mode);
     try std.testing.expectEqual(@as(u32, 0o660), cfg.log_mode);
+}
+
+/// Minimal slice-backed argument iterator so parseAttachArgs can be exercised
+/// without std.process.ArgIterator (which can't be constructed in a test).
+const SliceArgs = struct {
+    items: []const []const u8,
+    index: usize = 0,
+    fn next(self: *SliceArgs) ?[]const u8 {
+        if (self.index >= self.items.len) return null;
+        defer self.index += 1;
+        return self.items[self.index];
+    }
+};
+
+test "parseAttachArgs extracts --restore-from and keeps it out of command args" {
+    const alloc = std.testing.allocator;
+
+    // attach <session> --restore-from <file> -- echo hi
+    // (session is consumed before parseAttachArgs; we model the trailing args)
+    var it = SliceArgs{ .items = &.{ "--restore-from", "/tmp/snap.bin", "echo", "hi" } };
+    var parsed = try parseAttachArgs(alloc, &it);
+    defer parsed.command_args.deinit(alloc);
+
+    try std.testing.expect(parsed.restore_from != null);
+    try std.testing.expectEqualStrings("/tmp/snap.bin", parsed.restore_from.?);
+
+    // Neither the flag nor its value leaked into the spawned command.
+    for (parsed.command_args.items) |a| {
+        try std.testing.expect(!std.mem.eql(u8, a, "--restore-from"));
+        try std.testing.expect(!std.mem.eql(u8, a, "/tmp/snap.bin"));
+    }
+    // The genuine command survives intact.
+    try std.testing.expectEqual(@as(usize, 2), parsed.command_args.items.len);
+    try std.testing.expectEqualStrings("echo", parsed.command_args.items[0]);
+    try std.testing.expectEqualStrings("hi", parsed.command_args.items[1]);
+}
+
+test "parseAttachArgs leaves restore_from null when flag absent" {
+    const alloc = std.testing.allocator;
+
+    var it = SliceArgs{ .items = &.{ "echo", "hello" } };
+    var parsed = try parseAttachArgs(alloc, &it);
+    defer parsed.command_args.deinit(alloc);
+
+    try std.testing.expect(parsed.restore_from == null);
+    try std.testing.expectEqual(@as(usize, 2), parsed.command_args.items.len);
+}
+
+test "parseAttachArgs errors on missing --restore-from value" {
+    const alloc = std.testing.allocator;
+
+    var it = SliceArgs{ .items = &.{"--restore-from"} };
+    try std.testing.expectError(error.MissingRestoreFromValue, parseAttachArgs(alloc, &it));
 }
 
 /// Daemon is responsible for managing a zmx session.
@@ -2646,6 +2726,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                 if (bytes.len > 0) {
                     vt_stream.nextSlice(bytes);
                     daemon.has_pty_output = true;
+                    std.log.info("restore-from applied path={s}", .{path});
                 }
             } else |err| {
                 std.log.warn("restore-from read failed path={s} err={s}", .{ path, @errorName(err) });
