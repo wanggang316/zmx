@@ -79,9 +79,15 @@ pub fn build(b: *std.Build) void {
     // Integration tests (bats)
     {
         const integration_step = b.step("test-integration", "Run bats integration tests");
-        const bats = b.addSystemCommand(&.{ "bats", "test/session.bats" });
-        bats.step.dependOn(b.getInstallStep());
-        integration_step.dependOn(&bats.step);
+
+        const session_bats = b.addSystemCommand(&.{ "bats", "test/session.bats" });
+        session_bats.step.dependOn(b.getInstallStep());
+        integration_step.dependOn(&session_bats.step);
+
+        // restore.bats drives `attach --restore-from` against the real binary.
+        const restore_bats = b.addSystemCommand(&.{ "bats", "test/restore.bats" });
+        restore_bats.step.dependOn(b.getInstallStep());
+        integration_step.dependOn(&restore_bats.step);
     }
 
     // Check for LSP integration
