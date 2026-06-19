@@ -514,6 +514,18 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
             sb_bottom.x = @intCast(pages.cols - 1);
 
             var scroll_fmt = ghostty_vt.formatter.TerminalFormatter.init(term, .vt);
+            // Emit scrollback as logical lines, not as the visual rows wrapped
+            // at the serialize-time width. With unwrap=false the formatter
+            // terminates EVERY visual row (including soft-wrap continuations)
+            // with a hard \r\n, collapsing each wrapped logical line into N
+            // independent lines. ghostty's resize reflow rewraps logical lines
+            // but never *merges* hard-newline lines, so restored scrollback
+            // would stay frozen at the old column width regardless of the new
+            // window size (the "resume renders narrow" bug). Unwrapping keeps
+            // each logical line whole so it re-wraps to the restore-time width.
+            // Phase 2 (visible screen) intentionally stays wrapped: its CUP
+            // positioning depends on the exact rendered rows.
+            scroll_fmt.opts.unwrap = true;
             scroll_fmt.content = .{
                 .selection = ghostty_vt.Selection.init(
                     screen_top,
@@ -1132,6 +1144,48 @@ test "serializeTerminalState with scrollback preserves visible content" {
     try expectMarkerAtRow(alloc, &client, "MARK_B", 5);
     try expectMarkerAtRow(alloc, &client, "MARK_C", 9);
     try expectCursorAt(&client, 15, 19);
+}
+
+test "serializeTerminalState keeps scrollback lines logical for cross-width restore" {
+    // Regression for the "resume renders narrow" bug. A soft-wrapped scrollback
+    // line must serialize as ONE logical line (no interior CRLF) so that on
+    // restore it re-wraps to the new window width instead of staying frozen at
+    // the serialize-time column count. With the previous unwrap=false path the
+    // formatter baked a hard \r\n at every 40-col row boundary, splitting the
+    // line into independent rows that ghostty's resize reflow could never merge.
+    const alloc = testing.allocator;
+
+    // One logical line wider than the source terminal (40 cols) so it soft-wraps
+    // across several visual rows; the serializer must still emit it whole.
+    const long_line = "REFLOW_START_" ++ ("x" ** 60) ++ "_REFLOW_END"; // 84 chars
+
+    var narrow = try testCreateTerminal(alloc, 40, 24, "");
+    defer narrow.deinit(alloc);
+    {
+        var stream = narrow.vtStream();
+        defer stream.deinit();
+        stream.nextSlice(long_line ++ "\r\n");
+        // Push the long line up into scrollback so phase-1 serialization runs.
+        var buf: [16]u8 = undefined;
+        for (0..40) |i| {
+            const line = std.fmt.bufPrint(&buf, "FILL_{d}\r\n", .{i}) catch unreachable;
+            stream.nextSlice(line);
+        }
+    }
+
+    // The long line must have scrolled into history (phase 1 covers scrollback).
+    const pages = &narrow.screens.active.pages;
+    try testing.expect(!pages.getTopLeft(.screen).eql(pages.getTopLeft(.active)));
+
+    const serialized = serializeTerminalState(alloc, &narrow) orelse
+        return error.SerializationFailed;
+    defer alloc.free(serialized);
+
+    // The whole 84-char line appears as one contiguous run: no CRLF was inserted
+    // at the 40-col wrap point. Before the fix it serialized as
+    // "REFLOW_START_…(40 cols)\r\n…_REFLOW_END", so this match failed and the
+    // restored history stayed wrapped at 40 columns no matter the window width.
+    try testing.expect(std.mem.indexOf(u8, serialized, long_line) != null);
 }
 
 test "serializeTerminalState nested roundtrip preserves content" {
