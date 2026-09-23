@@ -1136,7 +1136,7 @@ const Daemon = struct {
             const saved_prompt_redraw = term.flags.shell_redraws_prompt;
             term.flags.shell_redraws_prompt = .false;
             defer term.flags.shell_redraws_prompt = saved_prompt_redraw;
-            try term.resize(self.alloc, resize.cols, resize.rows);
+            resizeTerminal(self.alloc, term, resize.cols, resize.rows);
 
             // Mark that we've had a client init, so subsequent clients get terminal state
             self.has_had_client = true;
@@ -1172,8 +1172,23 @@ const Daemon = struct {
         const saved_prompt_redraw = term.flags.shell_redraws_prompt;
         term.flags.shell_redraws_prompt = .false;
         defer term.flags.shell_redraws_prompt = saved_prompt_redraw;
-        try term.resize(self.alloc, resize.cols, resize.rows);
+        resizeTerminal(self.alloc, term, resize.cols, resize.rows);
         std.log.debug("resize rows={d} cols={d}", .{ resize.rows, resize.cols });
+    }
+
+    /// Resizes the daemon's own terminal model. The PTY already has the new
+    /// winsize by the time this runs, so the shell and whatever it runs see
+    /// the right size either way; this model only feeds the re-attach
+    /// snapshot. A reflow that fails (a large scrollback can trip the page
+    /// list's capacity check) must not take the session down with it — the
+    /// error used to propagate out of the daemon loop and kill the shell.
+    fn resizeTerminal(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal, cols: u16, rows: u16) void {
+        term.resize(alloc, cols, rows) catch |err| {
+            std.log.err(
+                "terminal resize failed, keeping session alive rows={d} cols={d} err={s}",
+                .{ rows, cols, @errorName(err) },
+            );
+        };
     }
 
     pub fn handleDetach(self: *Daemon, client: *Client, i: usize) void {
