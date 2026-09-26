@@ -88,6 +88,11 @@ pub fn build(b: *std.Build) void {
         const restore_bats = b.addSystemCommand(&.{ "bats", "test/restore.bats" });
         restore_bats.step.dependOn(b.getInstallStep());
         integration_step.dependOn(&restore_bats.step);
+
+        // observer.bats drives the read-only observer protocol (needs python3).
+        const observer_bats = b.addSystemCommand(&.{ "bats", "test/observer.bats" });
+        observer_bats.step.dependOn(b.getInstallStep());
+        integration_step.dependOn(&observer_bats.step);
     }
 
     // Check for LSP integration

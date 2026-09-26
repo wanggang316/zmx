@@ -4,6 +4,17 @@ Use spec: https://common-changelog.org/
 
 ## Staged
 
+### Added
+
+- Read-only observer protocol: `Observe` (15), `ObserveState` (16) and `ObserveResize` (17) IPC tags
+  - An observer gets a size-stamped snapshot with capped scrollback, the live output stream, and a resize notice at the exact stream position of every PTY resize
+  - An observer never becomes leader, never resizes the PTY and never writes to it
+- `test/observer.bats` integration suite
+
+### Fixed
+
+- Serializing terminal state now restores the mirror's synchronized output mode on failure paths too
+
 ## v0.6.0 - 2026-05-16
 
 ### Added

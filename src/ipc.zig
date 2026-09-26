@@ -19,8 +19,15 @@ pub const Tag = enum(u8) {
     Write = 12,
     TaskComplete = 13,
     Snapshot = 14,
+    // Read-only observer protocol. A client that sends Observe is never
+    // promoted to leader and never resizes the PTY; it receives a snapshot
+    // (ObserveState), the live Output stream, and a size notice
+    // (ObserveResize) at the exact stream position of every PTY resize.
+    Observe = 15,
+    ObserveState = 16,
+    ObserveResize = 17,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
-    // @enumFromInt, so out-of-range values (15-255) are representable
+    // @enumFromInt, so out-of-range values (18-255) are representable
     // rather than UB. Switches must handle `_` (unknown tag).
     _,
 };
@@ -40,6 +47,32 @@ pub const Resize = packed struct {
     rows: u16,
     cols: u16,
 };
+
+/// Observe payload (client → daemon). A shorter payload means 0; longer
+/// payloads are accepted and the tail ignored, so a future field can be
+/// appended without breaking this daemon.
+pub const Observe = extern struct {
+    /// Scrollback rows (visual rows above the viewport) to include in the
+    /// ObserveState snapshot. 0 sends the visible screen only.
+    scrollback_rows: u32,
+};
+
+/// Fixed prefix of an ObserveState payload (daemon → observer); the
+/// serialized terminal state follows immediately. rows/cols are the PTY's
+/// window size, i.e. the grid the snapshot and the following Output bytes
+/// are laid out for.
+pub const ObserveState = extern struct {
+    rows: u16,
+    cols: u16,
+    flags: u16,
+    reserved: u16 = 0,
+
+    pub const flag_alternate_screen: u16 = 1 << 0;
+    /// More scrollback existed than the observer asked for.
+    pub const flag_scrollback_truncated: u16 = 1 << 1;
+};
+
+// ObserveResize reuses `Resize` (rows u16, cols u16) as its payload.
 
 pub fn getTerminalSize(fd: i32) Resize {
     var ws: cross.c.struct_winsize = undefined;
@@ -261,13 +294,27 @@ test "Info wire size is frozen" {
 
 test "Tag wire values are frozen" {
     inline for (.{
-        .{ Tag.Input, 0 },  .{ Tag.Output, 1 },        .{ Tag.Resize, 2 },
-        .{ Tag.Detach, 3 }, .{ Tag.DetachAll, 4 },     .{ Tag.Kill, 5 },
-        .{ Tag.Info, 6 },   .{ Tag.Init, 7 },          .{ Tag.History, 8 },
-        .{ Tag.Run, 9 },    .{ Tag.Ack, 10 },          .{ Tag.Switch, 11 },
-        .{ Tag.Write, 12 }, .{ Tag.TaskComplete, 13 },
-        .{ Tag.Snapshot, 14 },
+        .{ Tag.Input, 0 },    .{ Tag.Output, 1 },        .{ Tag.Resize, 2 },
+        .{ Tag.Detach, 3 },   .{ Tag.DetachAll, 4 },     .{ Tag.Kill, 5 },
+        .{ Tag.Info, 6 },     .{ Tag.Init, 7 },          .{ Tag.History, 8 },
+        .{ Tag.Run, 9 },      .{ Tag.Ack, 10 },          .{ Tag.Switch, 11 },
+        .{ Tag.Write, 12 },   .{ Tag.TaskComplete, 13 }, .{ Tag.Snapshot, 14 },
+        .{ Tag.Observe, 15 }, .{ Tag.ObserveState, 16 }, .{ Tag.ObserveResize, 17 },
     }) |p| try std.testing.expectEqual(@as(u8, p[1]), @intFromEnum(p[0]));
+}
+
+test "observer payload wire shapes are frozen" {
+    try std.testing.expectEqual(@as(usize, 4), @sizeOf(Observe));
+    try std.testing.expectEqual(@as(usize, 8), @sizeOf(ObserveState));
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(ObserveState, "rows"));
+    try std.testing.expectEqual(@as(usize, 2), @offsetOf(ObserveState, "cols"));
+    try std.testing.expectEqual(@as(usize, 4), @offsetOf(ObserveState, "flags"));
+    try std.testing.expectEqual(@as(usize, 6), @offsetOf(ObserveState, "reserved"));
+    // ObserveResize payload: rows in bytes 0-1, cols in bytes 2-3 (LE).
+    const resize = Resize{ .rows = 0x0102, .cols = 0x0304 };
+    try std.testing.expectEqualSlices(u8, &.{ 0x02, 0x01, 0x04, 0x03 }, std.mem.asBytes(&resize)[0..4]);
+    try std.testing.expectEqual(@as(u16, ObserveState.flag_alternate_screen), 1);
+    try std.testing.expectEqual(@as(u16, ObserveState.flag_scrollback_truncated), 2);
 }
 
 test "zeroed Info has no stack garbage in wire bytes" {

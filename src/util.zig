@@ -477,6 +477,27 @@ pub fn isUserInput(payload: []const u8) bool {
 }
 
 pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal) ?[]const u8 {
+    const state = serializeTerminalStateWith(alloc, term, .{}) orelse return null;
+    return state.bytes;
+}
+
+pub const SerializeOptions = struct {
+    /// Upper bound on the scrollback rows (visual rows above the viewport)
+    /// emitted in phase 1; null emits all of it, 0 emits none.
+    max_scrollback_rows: ?usize = null,
+};
+
+pub const SerializedState = struct {
+    bytes: []const u8,
+    /// Scrollback existed beyond `max_scrollback_rows` and was left out.
+    scrollback_truncated: bool,
+};
+
+pub fn serializeTerminalStateWith(
+    alloc: std.mem.Allocator,
+    term: *ghostty_vt.Terminal,
+    opts: SerializeOptions,
+) ?SerializedState {
     var builder: std.Io.Writer.Allocating = .init(alloc);
     defer builder.deinit();
 
@@ -484,16 +505,35 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
     // between a program and its current terminal client. Replaying it to a
     // newly attached client can leave that client deferring renders until its
     // local timeout fires, so temporarily exclude it from restored state and
-    // restore the original mode before returning.
+    // restore the original mode before returning (on every path).
     const had_synchronized_output = term.modes.get(.synchronized_output);
     if (had_synchronized_output) {
         term.modes.set(.synchronized_output, false);
     }
+    defer if (had_synchronized_output) term.modes.set(.synchronized_output, true);
 
     const pages = &term.screens.active.pages;
     const screen_top = pages.getTopLeft(.screen);
     const active_top = pages.getTopLeft(.active);
     const has_scrollback = !screen_top.eql(active_top);
+
+    // Where phase 1 starts: the oldest row, or `max_scrollback_rows` above
+    // the viewport when the cap is smaller than the scrollback. `up` returns
+    // null when it would run past the oldest row, i.e. the cap covers it all.
+    var scrollback_top = screen_top;
+    var scrollback_truncated = false;
+    var emit_scrollback = has_scrollback;
+    if (has_scrollback) {
+        if (opts.max_scrollback_rows) |cap| {
+            if (cap == 0) {
+                emit_scrollback = false;
+                scrollback_truncated = true;
+            } else if (active_top.up(cap)) |capped_top| {
+                scrollback_truncated = !capped_top.eql(screen_top);
+                scrollback_top = capped_top;
+            }
+        }
+    }
 
     // Two-phase serialization to preserve scrollback without corrupting
     // cursor positions. This matters for nested zmx sessions (zmx→SSH→zmx)
@@ -507,8 +547,8 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
     //
     // See: https://github.com/neurosnap/zmx/issues/31
 
-    // Phase 1: scrollback only (if any exists)
-    if (has_scrollback) {
+    // Phase 1: scrollback only (if any exists and any was asked for)
+    if (emit_scrollback) {
         if (active_top.up(1)) |sb_bottom_row| {
             var sb_bottom = sb_bottom_row;
             sb_bottom.x = @intCast(pages.cols - 1);
@@ -528,7 +568,7 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
             scroll_fmt.opts.unwrap = true;
             scroll_fmt.content = .{
                 .selection = ghostty_vt.Selection.init(
-                    screen_top,
+                    scrollback_top,
                     sb_bottom,
                     false,
                 ),
@@ -586,15 +626,11 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
     const output = builder.writer.buffered();
     if (output.len == 0) return null;
 
-    // Restore the original synchronized_output mode before returning
-    if (had_synchronized_output) {
-        term.modes.set(.synchronized_output, true);
-    }
-
-    return alloc.dupe(u8, output) catch |err| {
+    const bytes = alloc.dupe(u8, output) catch |err| {
         std.log.warn("failed to allocate terminal state err={s}", .{@errorName(err)});
         return null;
     };
+    return .{ .bytes = bytes, .scrollback_truncated = scrollback_truncated };
 }
 
 pub const HistoryFormat = enum(u8) {
@@ -1006,6 +1042,88 @@ test "serializeTerminalState excludes synchronized output replay" {
     // but NOT synchronized output (DECSET 2026)
     try testing.expect(std.mem.indexOf(u8, output, "\x1b[?2004h") != null);
     try testing.expect(std.mem.indexOf(u8, output, "\x1b[?2026h") == null);
+}
+
+test "serializeTerminalState restores synchronized output on the live terminal" {
+    const alloc = testing.allocator;
+
+    var term = try testCreateTerminal(alloc, 80, 24, "\x1b[?2026hhello");
+    defer term.deinit(alloc);
+
+    const output = serializeTerminalState(alloc, &term) orelse return error.TestUnexpectedNull;
+    defer alloc.free(output);
+
+    try testing.expect(std.mem.indexOf(u8, output, "\x1b[?2026h") == null);
+    // The mirror keeps tracking the program's real mode after the snapshot.
+    try testing.expect(term.modes.get(.synchronized_output));
+}
+
+fn testScrollbackTerminal(alloc: std.mem.Allocator) !ghostty_vt.Terminal {
+    // 80 lines into 24 rows: SCROLL_57..79 plus the cursor's blank row stay
+    // visible, SCROLL_0..56 are scrollback.
+    var term = try testCreateTerminal(alloc, 80, 24, "");
+    var stream = term.vtStream();
+    defer stream.deinit();
+    var buf: [32]u8 = undefined;
+    for (0..80) |i| {
+        const line = std.fmt.bufPrint(&buf, "SCROLL_{d}\r\n", .{i}) catch unreachable;
+        stream.nextSlice(line);
+    }
+    return term;
+}
+
+test "serializeTerminalStateWith caps scrollback to the rows just above the viewport" {
+    const alloc = testing.allocator;
+
+    var term = try testScrollbackTerminal(alloc);
+    defer term.deinit(alloc);
+
+    const state = serializeTerminalStateWith(alloc, &term, .{ .max_scrollback_rows = 5 }) orelse
+        return error.TestUnexpectedNull;
+    defer alloc.free(state.bytes);
+
+    try testing.expect(state.scrollback_truncated);
+    try testing.expect(std.mem.indexOf(u8, state.bytes, "SCROLL_52") != null);
+    try testing.expect(std.mem.indexOf(u8, state.bytes, "SCROLL_56") != null);
+    try testing.expect(std.mem.indexOf(u8, state.bytes, "SCROLL_51") == null);
+    try testing.expect(std.mem.indexOf(u8, state.bytes, "SCROLL_0") == null);
+    // Visible rows are always complete.
+    try testing.expect(std.mem.indexOf(u8, state.bytes, "SCROLL_57") != null);
+    try testing.expect(std.mem.indexOf(u8, state.bytes, "SCROLL_79") != null);
+}
+
+test "serializeTerminalStateWith with zero scrollback rows sends the viewport only" {
+    const alloc = testing.allocator;
+
+    var term = try testScrollbackTerminal(alloc);
+    defer term.deinit(alloc);
+
+    const state = serializeTerminalStateWith(alloc, &term, .{ .max_scrollback_rows = 0 }) orelse
+        return error.TestUnexpectedNull;
+    defer alloc.free(state.bytes);
+
+    try testing.expect(state.scrollback_truncated);
+    try testing.expect(std.mem.indexOf(u8, state.bytes, "SCROLL_56") == null);
+    try testing.expect(std.mem.indexOf(u8, state.bytes, "SCROLL_57") != null);
+
+    // The viewport still round-trips into a same-size terminal.
+    var client = try testCreateTerminal(alloc, 80, 24, state.bytes);
+    defer client.deinit(alloc);
+    try expectScreensMatch(alloc, &term, &client);
+}
+
+test "serializeTerminalStateWith with a cap above the scrollback keeps all of it" {
+    const alloc = testing.allocator;
+
+    var term = try testScrollbackTerminal(alloc);
+    defer term.deinit(alloc);
+
+    const state = serializeTerminalStateWith(alloc, &term, .{ .max_scrollback_rows = 1000 }) orelse
+        return error.TestUnexpectedNull;
+    defer alloc.free(state.bytes);
+
+    try testing.expect(!state.scrollback_truncated);
+    try testing.expect(std.mem.indexOf(u8, state.bytes, "SCROLL_0") != null);
 }
 
 fn testCreateTerminal(alloc: std.mem.Allocator, cols: u16, rows: u16, vt_data: []const u8) !ghostty_vt.Terminal {

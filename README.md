@@ -505,6 +505,22 @@ How it works:
 
 In this way, `ghostty-vt` doesn't sit in the middle of an active terminal session, it simply receives all the same data the client receives so it can re-hydrate clients that connect to the session. This enables users to pick up where they left off as if they didn't disconnect from the terminal session at all. It also has the added benefit of being very fast, the only thing sitting in-between you and your PTY is a unix socket.
 
+### read-only observers
+
+A client can mirror a session without ever steering it. It speaks the daemon's socket protocol directly (every frame is an 8-byte header — `tag u8`, `len u32` little-endian, 3 padding bytes — followed by `len` payload bytes; all integers little-endian):
+
+| tag | name | direction | payload |
+| --- | --- | --- | --- |
+| 15 | `Observe` | client → daemon | `scrollback_rows u32` (0 = visible screen only; shorter payload = 0; extra bytes ignored) |
+| 16 | `ObserveState` | daemon → client | `rows u16, cols u16, flags u16, reserved u16` then the serialized terminal state |
+| 17 | `ObserveResize` | daemon → client | `rows u16, cols u16` |
+
+- Sending `Observe` marks the connection as an observer for the rest of its life. The daemon ignores its `Input`, `Init` and `Resize` frames: an observer never becomes leader, never resizes the PTY and never types into it. It also never counts as a real terminal, so the daemon keeps answering device-attribute queries on its behalf.
+- `ObserveState` is queued behind every `Output` frame already buffered for that client. `rows`/`cols` are the PTY's window size. `flags`: bit 0 = alternate screen active, bit 1 = scrollback beyond `scrollback_rows` was left out. The body is the same two-phase snapshot a re-attach gets (capped scrollback, then a cleared screen and the visible grid with modes and cursor) and never turns synchronized output (DECSET 2026) on. Apply it to a freshly reset emulator, then keep applying the `Output` frames that follow: there is no gap and no overlap.
+- It is sent on every `Observe`, including before any real client has attached. Re-send `Observe` at any time to resync.
+- `ObserveResize` is queued to every observer whenever the leader changes the PTY size, at the same position in the stream as the resize, so the observer switches grid size at the right byte.
+- Old daemons ignore tag 15 (unknown tags are logged and dropped), so a client that gets no `ObserveState` should fall back to `History`.
+
 ## prior art
 
 Below is a list of projects that inspired me to build this project. Architecturally, `zmx` uses aspects of both projects. For example, `shpool` inspired the idea of having libghostty restore the terminal state on reattach. Abduco inspired the idea of one daemon (and unix socket) per session.

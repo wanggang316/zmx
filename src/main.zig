@@ -539,6 +539,9 @@ const Client = struct {
     alloc: std.mem.Allocator,
     socket_fd: i32,
     has_pending_output: bool = false,
+    // Set once the client sends .Observe: a read-only mirror that never
+    // becomes leader, never resizes the PTY, and never writes to it.
+    is_observer: bool = false,
     read_buf: ipc.SocketBuffer,
     write_buf: std.ArrayList(u8),
 
@@ -1042,6 +1045,7 @@ const Daemon = struct {
     }
 
     pub fn handleInput(self: *Daemon, client: *Client, payload: []const u8) !void {
+        if (client.is_observer) return;
         std.log.debug("buffering pty input data={x}", .{payload});
         // client is leader, send entire payload (ansi escape codes + text)
         if (self.leader_client_fd == client.socket_fd) {
@@ -1084,6 +1088,7 @@ const Daemon = struct {
         term: *ghostty_vt.Terminal,
         payload: []const u8,
     ) !void {
+        if (client.is_observer) return;
         if (payload.len != @sizeOf(ipc.Resize)) return;
 
         // Serialize terminal state BEFORE resize to capture correct cursor position.
@@ -1122,21 +1127,7 @@ const Daemon = struct {
         // only resize if leader
         if (self.leader_client_fd == client.socket_fd) {
             const resize = std.mem.bytesToValue(ipc.Resize, payload);
-            var ws: cross.c.struct_winsize = .{
-                .ws_row = resize.rows,
-                .ws_col = resize.cols,
-                .ws_xpixel = 0,
-                .ws_ypixel = 0,
-            };
-            _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
-            // Disable prompt_redraw before resize. The daemon's internal terminal
-            // would otherwise clear prompt lines expecting the shell to redraw them,
-            // but the shell's redraw goes to the PTY (forwarded to clients), not to
-            // this daemon terminal. The clearing corrupts the daemon's snapshot state.
-            const saved_prompt_redraw = term.flags.shell_redraws_prompt;
-            term.flags.shell_redraws_prompt = .false;
-            defer term.flags.shell_redraws_prompt = saved_prompt_redraw;
-            resizeTerminal(self.alloc, term, resize.cols, resize.rows);
+            self.resizePty(pty_fd, term, resize);
 
             // Mark that we've had a client init, so subsequent clients get terminal state
             self.has_had_client = true;
@@ -1153,6 +1144,7 @@ const Daemon = struct {
         term: *ghostty_vt.Terminal,
         payload: []const u8,
     ) !void {
+        if (client.is_observer) return;
         if (payload.len != @sizeOf(ipc.Resize)) return;
         if (self.leader_client_fd == null) {
             try self.setLeader(client);
@@ -1161,6 +1153,16 @@ const Daemon = struct {
         if (self.leader_client_fd != client.socket_fd) return;
 
         const resize = std.mem.bytesToValue(ipc.Resize, payload);
+        self.resizePty(pty_fd, term, resize);
+        std.log.debug("resize rows={d} cols={d}", .{ resize.rows, resize.cols });
+    }
+
+    /// Applies a leader's window size to the PTY and the terminal mirror,
+    /// then tells observers. The notice is queued behind every Output frame
+    /// already buffered, so an observer switches grid size at the same byte
+    /// the leader did.
+    fn resizePty(self: *Daemon, pty_fd: i32, term: *ghostty_vt.Terminal, resize: ipc.Resize) void {
+        const previous = ipc.getTerminalSize(pty_fd);
         var ws: cross.c.struct_winsize = .{
             .ws_row = resize.rows,
             .ws_col = resize.cols,
@@ -1168,12 +1170,82 @@ const Daemon = struct {
             .ws_ypixel = 0,
         };
         _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
-        // Disable prompt_redraw before resize (same rationale as handleInit).
+        // Disable prompt_redraw before resize. The daemon's internal terminal
+        // would otherwise clear prompt lines expecting the shell to redraw them,
+        // but the shell's redraw goes to the PTY (forwarded to clients), not to
+        // this daemon terminal. The clearing corrupts the daemon's snapshot state.
         const saved_prompt_redraw = term.flags.shell_redraws_prompt;
         term.flags.shell_redraws_prompt = .false;
         defer term.flags.shell_redraws_prompt = saved_prompt_redraw;
         resizeTerminal(self.alloc, term, resize.cols, resize.rows);
-        std.log.debug("resize rows={d} cols={d}", .{ resize.rows, resize.cols });
+
+        const current = ipc.getTerminalSize(pty_fd);
+        if (current.rows == previous.rows and current.cols == previous.cols) return;
+        for (self.clients.items) |observer| {
+            if (!observer.is_observer) continue;
+            ipc.appendMessage(self.alloc, &observer.write_buf, .ObserveResize, std.mem.asBytes(&current)) catch |err| {
+                std.log.warn("failed to buffer observer resize err={s}", .{@errorName(err)});
+                continue;
+            };
+            observer.has_pending_output = true;
+        }
+    }
+
+    /// Turns the client into an observer and sends it a fresh snapshot.
+    /// Re-sending .Observe resyncs: the snapshot lands after every Output
+    /// frame already queued for this client, so applying it to a reset
+    /// emulator and continuing with the frames that follow has no gap and
+    /// no duplicate. Unlike re-attach this does not wait for has_had_client:
+    /// an observer never answers terminal queries, so it cannot disturb the
+    /// shell's startup handshake.
+    pub fn handleObserve(
+        self: *Daemon,
+        client: *Client,
+        pty_fd: i32,
+        term: *ghostty_vt.Terminal,
+        payload: []const u8,
+    ) !void {
+        const scrollback_rows: u32 = if (payload.len >= @sizeOf(ipc.Observe))
+            std.mem.bytesToValue(ipc.Observe, payload[0..@sizeOf(ipc.Observe)]).scrollback_rows
+        else
+            0;
+
+        client.is_observer = true;
+        // A client that typed before observing gives up the lead; the next
+        // real client to send input claims it.
+        if (self.leader_client_fd == client.socket_fd) self.leader_client_fd = null;
+
+        const size = ipc.getTerminalSize(pty_fd);
+        var header = ipc.ObserveState{ .rows = size.rows, .cols = size.cols, .flags = 0 };
+        if (term.screens.active_key == .alternate) {
+            header.flags |= ipc.ObserveState.flag_alternate_screen;
+        }
+
+        const state = util.serializeTerminalStateWith(self.alloc, term, .{
+            .max_scrollback_rows = scrollback_rows,
+        });
+        defer if (state) |st| self.alloc.free(st.bytes);
+        var body: []const u8 = "";
+        if (state) |st| {
+            if (st.scrollback_truncated) header.flags |= ipc.ObserveState.flag_scrollback_truncated;
+            body = st.bytes;
+        }
+        // Same OSC 133;A rewrite as the live Output stream, so the snapshot
+        // and the stream agree on prompt redraw behaviour.
+        const rewritten = util.rewritePromptRedraw(self.alloc, body);
+        defer if (rewritten) |r| self.alloc.free(r);
+        if (rewritten) |r| body = r;
+
+        var message: std.ArrayList(u8) = .empty;
+        defer message.deinit(self.alloc);
+        try message.appendSlice(self.alloc, std.mem.asBytes(&header));
+        try message.appendSlice(self.alloc, body);
+        try ipc.appendMessage(self.alloc, &client.write_buf, .ObserveState, message.items);
+        client.has_pending_output = true;
+        std.log.info(
+            "observer synced fd={d} rows={d} cols={d} bytes={d}",
+            .{ client.socket_fd, size.rows, size.cols, body.len },
+        );
     }
 
     /// Resizes the daemon's own terminal model. The PTY already has the new
@@ -2962,6 +3034,9 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                             try daemon.handleSnapshot(&term);
                             break :daemon_loop;
                         },
+                        .Observe => try daemon.handleObserve(client, pty_fd, &term, msg.payload),
+                        // Daemon-to-client only; a client echoing them is ignored.
+                        .ObserveState, .ObserveResize => {},
                         _ => std.log.warn(
                             "ignoring unknown IPC tag={d}",
                             .{@intFromEnum(msg.header.tag)},
