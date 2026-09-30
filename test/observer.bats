@@ -79,13 +79,14 @@ pty_size() {
   local none="$BATS_TEST_TMPDIR/none" all="$BATS_TEST_TMPDIR/all"
   run observer_client state "$(session_socket "$sess")" 0 "$none"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"flags=2 "* ]]   # scrollback_truncated, primary screen
+  # scrollback_truncated | leader_handoff, primary screen
+  [[ "$output" == *"flags=6 "* ]]
   run grep -qF -- "$oldest" "$none"
   [ "$status" -ne 0 ]
 
   run observer_client state "$(session_socket "$sess")" 100000 "$all"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"flags=0 "* ]]
+  [[ "$output" == *"flags=4 "* ]]   # leader_handoff only
   grep -qF -- "$oldest" "$all"
 }
 

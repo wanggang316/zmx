@@ -26,8 +26,18 @@ pub const Tag = enum(u8) {
     Observe = 15,
     ObserveState = 16,
     ObserveResize = 17,
+    // Leader hand-off (client → daemon, empty payloads). Claim makes a
+    // non-observer client that has sent Init the leader without typing: the
+    // daemon asks it for its size (Resize request) and the reply resizes the
+    // PTY. Release, from the leader, hands the lead to the most recently
+    // active other client that has sent Init; the sender stays connected.
+    // The same hand-back runs when the leader disconnects. Daemons that
+    // support this set ObserveState.flag_leader_handoff; older ones ignore
+    // both tags through the `_` arm.
+    Claim = 18,
+    Release = 19,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
-    // @enumFromInt, so out-of-range values (18-255) are representable
+    // @enumFromInt, so out-of-range values (20-255) are representable
     // rather than UB. Switches must handle `_` (unknown tag).
     _,
 };
@@ -70,6 +80,10 @@ pub const ObserveState = extern struct {
     pub const flag_alternate_screen: u16 = 1 << 0;
     /// More scrollback existed than the observer asked for.
     pub const flag_scrollback_truncated: u16 = 1 << 1;
+    /// The daemon understands Claim / Release and hands the lead back to
+    /// the most recently active attached client when the leader leaves.
+    /// Always set by daemons that support it; older daemons never set it.
+    pub const flag_leader_handoff: u16 = 1 << 2;
 };
 
 // ObserveResize reuses `Resize` (rows u16, cols u16) as its payload.
@@ -300,6 +314,7 @@ test "Tag wire values are frozen" {
         .{ Tag.Run, 9 },      .{ Tag.Ack, 10 },          .{ Tag.Switch, 11 },
         .{ Tag.Write, 12 },   .{ Tag.TaskComplete, 13 }, .{ Tag.Snapshot, 14 },
         .{ Tag.Observe, 15 }, .{ Tag.ObserveState, 16 }, .{ Tag.ObserveResize, 17 },
+        .{ Tag.Claim, 18 },   .{ Tag.Release, 19 },
     }) |p| try std.testing.expectEqual(@as(u8, p[1]), @intFromEnum(p[0]));
 }
 
@@ -315,6 +330,7 @@ test "observer payload wire shapes are frozen" {
     try std.testing.expectEqualSlices(u8, &.{ 0x02, 0x01, 0x04, 0x03 }, std.mem.asBytes(&resize)[0..4]);
     try std.testing.expectEqual(@as(u16, ObserveState.flag_alternate_screen), 1);
     try std.testing.expectEqual(@as(u16, ObserveState.flag_scrollback_truncated), 2);
+    try std.testing.expectEqual(@as(u16, ObserveState.flag_leader_handoff), 4);
 }
 
 test "zeroed Info has no stack garbage in wire bytes" {

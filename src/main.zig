@@ -542,6 +542,13 @@ const Client = struct {
     // Set once the client sends .Observe: a read-only mirror that never
     // becomes leader, never resizes the PTY, and never writes to it.
     is_observer: bool = false,
+    // Set once a non-observer client sends .Init, i.e. it is a terminal with
+    // a window size. Only such clients are candidates for leader hand-back;
+    // control connections (Info/History/Run/Write...) never send .Init.
+    has_init: bool = false,
+    // When the client last sent .Init, user input, or .Claim (see
+    // Daemon.markActive). Picks the hand-back target.
+    last_active_ns: u64 = 0,
     read_buf: ipc.SocketBuffer,
     write_buf: std.ArrayList(u8),
 
@@ -722,6 +729,9 @@ const Daemon = struct {
     // This control which client is the leader.  The leader controls terminal state and
     // cols/rows of session.
     leader_client_fd: ?i32,
+    // Last value handed out by markActive; keeps activity stamps strictly
+    // increasing even if the wall clock steps back.
+    last_active_ns: u64 = 0,
     session_name: []const u8,
     socket_path: []const u8,
     running: bool,
@@ -771,8 +781,8 @@ const Daemon = struct {
 
     pub fn closeClient(self: *Daemon, client: *Client, i: usize, shutdown_on_last: bool) bool {
         const fd = client.socket_fd;
-        // leader is disconnected, remove ref and let another client claim leader on input
-        if (self.leader_client_fd == client.socket_fd) {
+        const was_leader = self.leader_client_fd == client.socket_fd;
+        if (was_leader) {
             std.log.info(
                 "unsetting leader session={s} fd={d}",
                 .{ self.session_name, client.socket_fd },
@@ -783,6 +793,10 @@ const Daemon = struct {
         self.alloc.destroy(client);
         _ = self.clients.orderedRemove(i);
         std.log.info("client disconnected fd={d} remaining={d}", .{ fd, self.clients.items.len });
+        // The departed client is already out of the list, so it cannot be
+        // picked; with no candidate left the lead stays empty until a
+        // client types.
+        if (was_leader) self.handBackLead(null);
         if (shutdown_on_last and self.clients.items.len == 0) {
             self.shutdown();
             return true;
@@ -797,6 +811,48 @@ const Daemon = struct {
         // so we can resize the pty and ghostty state.
         try ipc.appendMessage(self.alloc, &client.write_buf, .Resize, "");
         client.has_pending_output = true;
+    }
+
+    /// Stamps the client as the most recently active one.
+    fn markActive(self: *Daemon, client: *Client) void {
+        const now: u64 = @intCast(@max(0, std.time.nanoTimestamp()));
+        self.last_active_ns = @max(now, self.last_active_ns + 1);
+        client.last_active_ns = self.last_active_ns;
+    }
+
+    /// Gives the lead to the most recently active non-observer client that
+    /// has sent .Init, other than `excluded_fd`, so the PTY size follows the
+    /// device the user touched last (setLeader asks it for its size and its
+    /// reply resizes the PTY). Leaves the lead empty when no client
+    /// qualifies.
+    fn handBackLead(self: *Daemon, excluded_fd: ?i32) void {
+        self.leader_client_fd = null;
+        var next: ?*Client = null;
+        for (self.clients.items) |candidate| {
+            if (candidate.is_observer or !candidate.has_init) continue;
+            if (excluded_fd) |fd| if (candidate.socket_fd == fd) continue;
+            if (next == null or candidate.last_active_ns >= next.?.last_active_ns) next = candidate;
+        }
+        const client = next orelse return;
+        self.setLeader(client) catch |err| {
+            std.log.warn("leader hand-back failed fd={d} err={s}", .{ client.socket_fd, @errorName(err) });
+            self.leader_client_fd = null;
+        };
+    }
+
+    /// .Claim: a terminal client takes the lead without typing.
+    pub fn handleClaim(self: *Daemon, client: *Client) !void {
+        if (client.is_observer or !client.has_init) return;
+        self.markActive(client);
+        // Also when already leader: the fresh size request doubles as an ack.
+        try self.setLeader(client);
+    }
+
+    /// .Release: the leader hands the lead back and stays connected.
+    pub fn handleRelease(self: *Daemon, client: *Client) void {
+        if (self.leader_client_fd != client.socket_fd) return;
+        std.log.info("leader released fd={d}", .{client.socket_fd});
+        self.handBackLead(client.socket_fd);
     }
 
     /// Runs in the forked child. Either execs or returns an error (caller
@@ -1049,13 +1105,21 @@ const Daemon = struct {
         std.log.debug("buffering pty input data={x}", .{payload});
         // client is leader, send entire payload (ansi escape codes + text)
         if (self.leader_client_fd == client.socket_fd) {
+            if (util.isUserInput(payload)) self.markActive(client);
             self.queuePtyInput(payload);
             return;
         }
 
         // check if leader needs to be updated by detecting any user input
         if (util.isUserInput(payload)) {
-            try self.setLeader(client);
+            // A client without a window (never sent .Init, e.g. `zmx send`)
+            // types through without taking the lead: the lead decides the
+            // PTY size and it has none. Taking it would also make its
+            // disconnect hand the lead to some other client.
+            if (client.has_init) {
+                self.markActive(client);
+                try self.setLeader(client);
+            }
             self.queuePtyInput(payload);
         }
     }
@@ -1090,6 +1154,8 @@ const Daemon = struct {
     ) !void {
         if (client.is_observer) return;
         if (payload.len != @sizeOf(ipc.Resize)) return;
+        client.has_init = true;
+        self.markActive(client);
 
         // Serialize terminal state BEFORE resize to capture correct cursor position.
         // Resizing triggers reflow which can move the cursor, and the shell's
@@ -1211,12 +1277,16 @@ const Daemon = struct {
             0;
 
         client.is_observer = true;
-        // A client that typed before observing gives up the lead; the next
-        // real client to send input claims it.
-        if (self.leader_client_fd == client.socket_fd) self.leader_client_fd = null;
+        // A client that led before observing gives up the lead, handed
+        // back like a disconnect (observers are never candidates).
+        if (self.leader_client_fd == client.socket_fd) self.handBackLead(client.socket_fd);
 
         const size = ipc.getTerminalSize(pty_fd);
-        var header = ipc.ObserveState{ .rows = size.rows, .cols = size.cols, .flags = 0 };
+        var header = ipc.ObserveState{
+            .rows = size.rows,
+            .cols = size.cols,
+            .flags = ipc.ObserveState.flag_leader_handoff,
+        };
         if (term.screens.active_key == .alternate) {
             header.flags |= ipc.ObserveState.flag_alternate_screen;
         }
@@ -1275,6 +1345,8 @@ const Daemon = struct {
             self.alloc.destroy(client_to_close);
         }
         self.clients.clearRetainingCapacity();
+        // The leader's fd is closed and may be reused by the next client.
+        self.leader_client_fd = null;
     }
 
     pub fn handleKill(self: *Daemon) void {
@@ -3037,6 +3109,8 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                         .Observe => try daemon.handleObserve(client, pty_fd, &term, msg.payload),
                         // Daemon-to-client only; a client echoing them is ignored.
                         .ObserveState, .ObserveResize => {},
+                        .Claim => try daemon.handleClaim(client),
+                        .Release => daemon.handleRelease(client),
                         _ => std.log.warn(
                             "ignoring unknown IPC tag={d}",
                             .{@intFromEnum(msg.header.tag)},

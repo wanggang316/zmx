@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Minimal zmx IPC client for observer.bats.
+"""Minimal zmx IPC client for observer.bats and leader.bats.
 
 Speaks the daemon's wire format directly so the tests exercise the observer
 protocol the way an embedding app would, without a TTY:
@@ -9,18 +9,21 @@ protocol the way an embedding app would, without a TTY:
   Observe       (15) payload: scrollback_rows u32
   ObserveState  (16) payload: rows u16, cols u16, flags u16, reserved u16, vt bytes
   ObserveResize (17) payload: rows u16, cols u16
+  Claim         (18) / Release (19): empty payloads (leader hand-off)
 
 Every subcommand prints plain `key value...` lines for bats to match and
 exits non-zero on a timeout or protocol surprise.
 """
 
+import os
 import socket
 import struct
 import sys
 import time
 
-INPUT, OUTPUT, RESIZE, INIT = 0, 1, 2, 7
+INPUT, OUTPUT, RESIZE, INFO, INIT = 0, 1, 2, 6, 7
 OBSERVE, OBSERVE_STATE, OBSERVE_RESIZE = 15, 16, 17
+CLAIM, RELEASE = 18, 19
 TIMEOUT = 5.0
 
 
@@ -163,7 +166,107 @@ def cmd_output(path, needle):
     sock.close()
 
 
+class Participant:
+    """A terminal-like client scripted by a list of actions.
+
+    It answers every empty Resize request (the daemon's "you lead now, what
+    is your size?") with its own rows×cols, like `zmx attach` does, and
+    follows each answer with an Info round-trip: the daemon handles one
+    client's frames in order, so the Info reply proves the PTY already took
+    the size. At that point it prints `applied N` (N = requests answered).
+    """
+
+    def __init__(self, path, rows, cols):
+        self.sock = connect(path)
+        self.reader = Reader(self.sock)
+        self.size = size_payload(rows, cols)
+        self.leads = 0
+        self.applied = 0
+        self.info_waiters = []  # "apply" / "sync" per Info sent, in order
+
+    def pump(self, deadline):
+        tag, payload = self.reader.next_frame(deadline)
+        if tag == RESIZE and not payload:
+            self.leads += 1
+            send(self.sock, RESIZE, self.size)
+            send(self.sock, INFO)
+            self.info_waiters.append("apply")
+        elif tag == INFO:
+            kind = self.info_waiters.pop(0)
+            if kind == "apply":
+                self.applied += 1
+                print(f"applied {self.applied}", flush=True)
+            return kind
+        elif tag == OBSERVE_STATE:
+            rows, cols, flags, _ = struct.unpack_from("<HHHH", payload, 0)
+            print(f"state {rows} {cols} flags={flags}", flush=True)
+        return None
+
+    def sync(self):
+        send(self.sock, INFO)
+        self.info_waiters.append("sync")
+        deadline = time.monotonic() + TIMEOUT
+        while self.pump(deadline) != "sync":
+            pass
+
+    def await_lead(self):
+        """Waits until one more size request has been answered and applied."""
+        target = self.applied + 1
+        deadline = time.monotonic() + TIMEOUT
+        while self.applied < target:
+            self.pump(deadline)
+
+    def wait_file(self, path, timeout=30.0):
+        deadline = time.monotonic() + timeout
+        while not os.path.exists(path):
+            try:
+                self.pump(min(deadline, time.monotonic() + 0.1))
+            except (TimeoutError, socket.timeout):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"{path} never appeared")
+
+    def run(self, action):
+        verb, _, arg = action.partition(":")
+        if verb == "init":
+            send(self.sock, INIT, self.size)
+        elif verb == "observe":
+            send(self.sock, OBSERVE, struct.pack("<I", 0))
+        elif verb == "claim":
+            send(self.sock, CLAIM)
+        elif verb == "release":
+            send(self.sock, RELEASE)
+        elif verb == "input":
+            send(self.sock, INPUT, arg.encode() + b"\r")
+        elif verb == "sync":
+            self.sync()
+        elif verb == "await-lead":
+            self.await_lead()
+        elif verb == "touch":
+            open(arg, "w").close()
+        elif verb == "wait-file":
+            self.wait_file(arg)
+        else:
+            raise ValueError(f"unknown action {action}")
+
+
+def cmd_participant(path, rows, cols, *actions):
+    """participant SOCK ROWS COLS ACTION...
+
+    Actions run in order: init, observe, claim, release, input:TEXT (sent
+    with a trailing CR), sync (Info round-trip), await-lead (wait for the
+    next size request to be answered and applied), touch:PATH,
+    wait-file:PATH (keeps answering size requests meanwhile). Prints
+    `leads N` (size requests received) before closing the connection.
+    """
+    participant = Participant(path, int(rows), int(cols))
+    for action in actions:
+        participant.run(action)
+    print(f"leads {participant.leads}", flush=True)
+    participant.sock.close()
+
+
 COMMANDS = {
+    "participant": cmd_participant,
     "leader-init": cmd_leader_init,
     "state": cmd_state,
     "mischief": cmd_mischief,
