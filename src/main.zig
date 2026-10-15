@@ -106,6 +106,11 @@ pub fn main() !void {
     // covers the daemon.
     ignoreSigpipe();
 
+    // The host may fork us without closing its own descriptors (libghostty
+    // does). Drop them before anything else opens a descriptor, so neither
+    // this client nor the daemon forked from it keeps the host's pipes open.
+    util.closeInheritedFds(&.{});
+
     var args = try std.process.argsWithAllocator(alloc);
     defer args.deinit();
     _ = args.skip(); // skip program name
@@ -1021,14 +1026,7 @@ const Daemon = struct {
                 //
                 // Skip server_sock_fd (needed for IPC) and dir.fd (needed to
                 // delete the socket file on shutdown).
-                {
-                    const dir_fd = @as(i32, @intCast(dir.fd));
-                    var fd: i32 = 3;
-                    while (fd < 64) : (fd += 1) {
-                        if (fd == server_sock_fd or fd == dir_fd) continue;
-                        _ = std.c.close(fd);
-                    }
-                }
+                util.closeInheritedFds(&.{ server_sock_fd, dir.fd });
 
                 const session_log_name = try std.fmt.allocPrint(
                     self.alloc,
