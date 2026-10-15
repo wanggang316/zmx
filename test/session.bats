@@ -28,6 +28,30 @@ load test_helper
   [[ "$output" == "test-create" ]]
 }
 
+@test "run: daemon does not keep high inherited descriptors open" {
+  # A host that forks zmx without a close-on-exec sweep (libghostty does)
+  # hands over descriptors at any number. If the daemon keeps the write end
+  # of a host pipe, the host never reads EOF from it.
+  local fifo="$BATS_TEST_TMPDIR/inherited"
+  mkfifo "$fifo"
+  cat "$fifo" > /dev/null &
+  local reader=$!
+
+  "$ZMX" run test-inherited -d true 300>"$fifo"
+  wait_for_session test-inherited
+
+  local i=0
+  while kill -0 "$reader" 2>/dev/null && (( i < 50 )); do
+    sleep 0.1
+    (( i++ )) || true
+  done
+  if kill -0 "$reader" 2>/dev/null; then
+    kill "$reader"
+    echo "a zmx process still holds the inherited write end" >&2
+    return 1
+  fi
+}
+
 @test "run: sends command to existing session" {
   "$ZMX" run test-send -d echo first
   wait_for_session test-send

@@ -650,6 +650,55 @@ pub fn detectShell() [:0]const u8 {
     return std.posix.getenv("SHELL") orelse "/bin/sh";
 }
 
+/// Closes every descriptor above stderr except the ones in `keep`.
+///
+/// A host that forks us without a close-on-exec sweep (libghostty spawns
+/// each pane with fork+exec) hands over every descriptor it had open, at any
+/// number. If one of them is the write end of a pipe the host reads to EOF,
+/// that read never ends while we live, and the daemon outlives the host. The
+/// open descriptors are listed from /dev/fd, so high numbers are covered
+/// without a close() call for each possible slot.
+pub fn closeInheritedFds(keep: []const posix.fd_t) void {
+    var batch: [256]posix.fd_t = undefined;
+    while (true) {
+        const count = listInheritedFds(keep, &batch) orelse {
+            closeFdRange(keep);
+            return;
+        };
+        for (batch[0..count]) |fd| _ = std.c.close(fd);
+        // A full batch can leave more open descriptors behind; list again.
+        if (count < batch.len) return;
+    }
+}
+
+/// Fills `out` with open descriptors above stderr that are not in `keep`.
+/// Returns null when /dev/fd cannot be listed.
+fn listInheritedFds(keep: []const posix.fd_t, out: []posix.fd_t) ?usize {
+    var dir = std.fs.openDirAbsolute("/dev/fd", .{ .iterate = true }) catch return null;
+    defer dir.close();
+    var count: usize = 0;
+    var it = dir.iterate();
+    while (it.next() catch return null) |entry| {
+        const fd = std.fmt.parseInt(posix.fd_t, entry.name, 10) catch continue;
+        if (fd <= posix.STDERR_FILENO or fd == dir.fd) continue;
+        if (std.mem.indexOfScalar(posix.fd_t, keep, fd) != null) continue;
+        out[count] = fd;
+        count += 1;
+        if (count == out.len) break;
+    }
+    return count;
+}
+
+fn closeFdRange(keep: []const posix.fd_t) void {
+    const limit = posix.getrlimit(.NOFILE) catch return;
+    const max: posix.fd_t = @intCast(@min(limit.cur, 65536));
+    var fd: posix.fd_t = posix.STDERR_FILENO + 1;
+    while (fd < max) : (fd += 1) {
+        if (std.mem.indexOfScalar(posix.fd_t, keep, fd) != null) continue;
+        _ = std.c.close(fd);
+    }
+}
+
 /// Formats a session entry for list output (only the name when `short` is
 /// true), adding a prefix to indicate the current session, if there is one.
 pub fn writeSessionLine(
@@ -1470,4 +1519,33 @@ test "isUserInput: bracketed paste included" {
     try testing.expect(isUserInput("\x1b[201~")); // paste end
     // Content between start/end is also user input
     try testing.expect(isUserInput("\x1b[200~hello\x1b[201~"));
+}
+
+test "closeInheritedFds closes high descriptors and keeps the listed ones" {
+    // Run in a forked child: the sweep closes every descriptor of the
+    // calling process, including ones the test runner owns.
+    const pipe_fds = try posix.pipe();
+    const high_fd: posix.fd_t = 900;
+    const kept_fd: posix.fd_t = 901;
+    _ = try posix.dup2(pipe_fds[1], high_fd);
+    _ = try posix.dup2(pipe_fds[1], kept_fd);
+    posix.close(pipe_fds[1]);
+    defer posix.close(pipe_fds[0]);
+    defer posix.close(high_fd);
+    defer posix.close(kept_fd);
+
+    const pid = try posix.fork();
+    if (pid == 0) {
+        closeInheritedFds(&.{kept_fd});
+        const closed = isOpenFd(high_fd) == false and isOpenFd(pipe_fds[0]) == false;
+        const kept = isOpenFd(kept_fd) and isOpenFd(posix.STDERR_FILENO);
+        std.c._exit(if (closed and kept) 0 else 1);
+    }
+    const result = posix.waitpid(pid, 0);
+    try testing.expect(posix.W.IFEXITED(result.status));
+    try testing.expectEqual(@as(u32, 0), posix.W.EXITSTATUS(result.status));
+}
+
+fn isOpenFd(fd: posix.fd_t) bool {
+    return std.c.fcntl(fd, posix.F.GETFD) != -1;
 }
