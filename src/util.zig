@@ -146,6 +146,13 @@ const DA2_QUERY_EXPLICIT = "\x1b[>0c";
 const DA1_RESPONSE = "\x1b[?62;22c";
 const DA2_RESPONSE = "\x1b[>1;10;0c";
 
+/// OSC 7501 (program status protocol) support query, without its
+/// terminator. A program such as Claude Code asks this once at startup and
+/// sends no status reports when the terminal does not answer. The reply
+/// lists the same states and kinds as the Ghostty fork that codans embeds.
+const PROGRAM_STATUS_QUERY = "\x1b]7501;?";
+const PROGRAM_STATUS_REPLY = "\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth";
+
 pub fn respondToDeviceAttributes(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), data: []const u8) void {
     // Scan for DA queries in PTY output and respond on behalf of the terminal.
     // This handles the case where no client is attached (e.g. zmx run)
@@ -161,8 +168,28 @@ pub fn respondToDeviceAttributes(alloc: std.mem.Allocator, buf: *std.ArrayList(u
     // DA1 response (from terminal): ESC [ ? ... c  (has '?' after '[')
     //
     // We must NOT match DA responses (which contain '?') as queries.
+    //
+    // The OSC 7501 support query (ESC ] 7501 ; ? ST) is answered here too,
+    // with the terminator of the query. Without it a program that starts
+    // before a client attaches sees the DA1 reply first and treats the
+    // protocol as unsupported for its whole run.
     var i: usize = 0;
     while (i < data.len) {
+        if (matchSeq(data[i..], PROGRAM_STATUS_QUERY)) {
+            const rest = data[i + PROGRAM_STATUS_QUERY.len ..];
+            const terminator: ?[]const u8 = if (matchSeq(rest, "\x07"))
+                "\x07"
+            else if (matchSeq(rest, "\x1b\\"))
+                "\x1b\\"
+            else
+                null;
+            if (terminator) |st| {
+                buf.appendSlice(alloc, PROGRAM_STATUS_REPLY) catch {};
+                buf.appendSlice(alloc, st) catch {};
+                i += PROGRAM_STATUS_QUERY.len + st.len;
+                continue;
+            }
+        }
         if (data[i] == '\x1b' and i + 1 < data.len and data[i + 1] == '[') {
             // Skip DA responses which have '?' after CSI
             if (i + 2 < data.len and data[i + 2] == '?') {
@@ -256,6 +283,30 @@ pub fn rewritePromptRedraw(alloc: std.mem.Allocator, data: []const u8) ?[]const 
     }
 
     return result.toOwnedSlice(alloc) catch null;
+}
+
+test "respondToDeviceAttributes: answers the OSC 7501 query with its terminator" {
+    const alloc = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+
+    respondToDeviceAttributes(alloc, &buf, "\x1b]7501;?\x1b\\");
+    try std.testing.expectEqualStrings(PROGRAM_STATUS_REPLY ++ "\x1b\\", buf.items);
+
+    buf.clearRetainingCapacity();
+    respondToDeviceAttributes(alloc, &buf, "abc\x1b]7501;?\x07\x1b[c");
+    try std.testing.expectEqualStrings(PROGRAM_STATUS_REPLY ++ "\x07" ++ DA1_RESPONSE, buf.items);
+}
+
+test "respondToDeviceAttributes: ignores OSC 7501 reports and replies" {
+    const alloc = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+
+    respondToDeviceAttributes(alloc, &buf, "\x1b]7501;state=working:app=claude-code\x1b\\");
+    respondToDeviceAttributes(alloc, &buf, PROGRAM_STATUS_REPLY ++ "\x07");
+    respondToDeviceAttributes(alloc, &buf, "\x1b]7501;?");
+    try std.testing.expectEqual(@as(usize, 0), buf.items.len);
 }
 
 test "rewritePromptRedraw: no OSC 133;A returns null" {
