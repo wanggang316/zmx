@@ -724,7 +724,7 @@ fn testClient(alloc: std.mem.Allocator, is_terminal: bool) !*Client {
     return client;
 }
 
-test "handleMark sends the payload to every client as output" {
+test "handleMark waits for a sequence boundary and keeps order" {
     const alloc = std.testing.allocator;
     var cfg: Cfg = undefined;
     var daemon = Daemon{
@@ -744,19 +744,39 @@ test "handleMark sends the payload to every client as output" {
             alloc.destroy(c);
         }
         daemon.clients.deinit(alloc);
+        for (daemon.pending_marks.items) |m| alloc.free(m);
+        daemon.pending_marks.deinit(alloc);
     }
     try daemon.clients.append(alloc, try testClient(alloc, false));
     try daemon.clients.append(alloc, try testClient(alloc, true));
 
-    try daemon.handleMark("fence");
+    var term = try ghostty_vt.Terminal.init(alloc, .{ .cols = 80, .rows = 24 });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
 
+    // At a boundary the mark goes out at once.
+    try daemon.handleMark("m0", &stream);
     var expected: std.ArrayList(u8) = .empty;
     defer expected.deinit(alloc);
-    try ipc.appendMessage(alloc, &expected, .Output, "fence");
-    for (daemon.clients.items) |c| {
-        try std.testing.expectEqualSlices(u8, expected.items, c.write_buf.items);
-        try std.testing.expect(c.has_pending_output);
-    }
+    try ipc.appendMessage(alloc, &expected, .Output, "m0");
+    for (daemon.clients.items) |c| try std.testing.expectEqualSlices(u8, expected.items, c.write_buf.items);
+
+    // Halfway through an OSC, and then through a UTF-8 character: wait.
+    stream.nextSlice("\x1b]0;hel");
+    try daemon.handleMark("m1", &stream);
+    try daemon.handleMark("m2", &stream);
+    stream.nextSlice("lo\x07\xe4\xb8");
+    try daemon.flushMarks(&stream);
+    for (daemon.clients.items) |c| try std.testing.expectEqualSlices(u8, expected.items, c.write_buf.items);
+
+    // The character completes: both marks follow, in order.
+    stream.nextSlice("\xad");
+    try daemon.flushMarks(&stream);
+    try ipc.appendMessage(alloc, &expected, .Output, "m1");
+    try ipc.appendMessage(alloc, &expected, .Output, "m2");
+    for (daemon.clients.items) |c| try std.testing.expectEqualSlices(u8, expected.items, c.write_buf.items);
+    try std.testing.expectEqual(@as(usize, 0), daemon.pending_marks.items.len);
 }
 
 test "has_terminal_client follows terminal clients, not passive ones" {
@@ -825,6 +845,9 @@ const Daemon = struct {
     is_fish: bool = false, // true if session shell is fish (affects exit code variable)
     pty_fd: i32 = -1, // set by daemonLoop so handleRun can probe the foreground process
     pty_write_buf: std.ArrayList(u8) = .empty,
+    /// `.Mark` payloads that wait for the PTY stream to reach a sequence
+    /// boundary (see `handleMark`), in arrival order.
+    pending_marks: std.ArrayList([]u8) = .empty,
     // Optional path to a serializeTerminalState snapshot. When set, the
     // daemon feeds it into the VT mirror before entering the poll loop so
     // restored screen contents are visible before the shell's first echo.
@@ -842,6 +865,8 @@ const Daemon = struct {
     pub fn deinit(self: *Daemon) void {
         self.clients.deinit(self.alloc);
         self.pty_write_buf.deinit(self.alloc);
+        for (self.pending_marks.items) |mark| self.alloc.free(mark);
+        self.pending_marks.deinit(self.alloc);
         self.alloc.free(self.socket_path);
     }
 
@@ -1437,11 +1462,30 @@ const Daemon = struct {
     /// Unlike `handleOutput`, it does not feed the terminal mirror (so it
     /// never reaches a snapshot or a re-attach replay) and does not send
     /// SIGWINCH to the child.
-    pub fn handleMark(self: *Daemon, payload: []const u8) !void {
-        for (self.clients.items) |client| {
-            try ipc.appendMessage(self.alloc, &client.write_buf, .Output, payload);
-            client.has_pending_output = true;
+    ///
+    /// The payload goes out only where the PTY stream is between sequences
+    /// (parser in ground state, no partial UTF-8 character). A mark sent
+    /// while the child is halfway through an escape sequence waits for its
+    /// end, so it never splits a sequence the clients are parsing. Marks
+    /// keep their order.
+    pub fn handleMark(self: *Daemon, payload: []const u8, vt_stream: anytype) !void {
+        try self.pending_marks.append(self.alloc, try self.alloc.dupe(u8, payload));
+        try self.flushMarks(vt_stream);
+    }
+
+    /// Send the pending marks if the PTY stream is at a sequence boundary.
+    /// Called after every write into the terminal mirror.
+    pub fn flushMarks(self: *Daemon, vt_stream: anytype) !void {
+        if (self.pending_marks.items.len == 0) return;
+        if (vt_stream.parser.state != .ground or vt_stream.utf8decoder.state != 0) return;
+        for (self.pending_marks.items) |mark| {
+            for (self.clients.items) |client| {
+                try ipc.appendMessage(self.alloc, &client.write_buf, .Output, mark);
+                client.has_pending_output = true;
+            }
+            self.alloc.free(mark);
         }
+        self.pending_marks.clearRetainingCapacity();
     }
 
     pub fn handleOutput(self: *Daemon, payload: []const u8, vt_stream: anytype) !void {
@@ -1456,6 +1500,7 @@ const Daemon = struct {
                 std.log.warn("failed to send SIGWINCH err={s}", .{@errorName(err)});
             };
         }
+        try self.flushMarks(vt_stream);
     }
 
     /// handleSnapshot serializes the daemon's terminal mirror to
@@ -2995,6 +3040,9 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                         };
                         client.has_pending_output = true;
                     }
+                    daemon.flushMarks(&vt_stream) catch |err| {
+                        std.log.warn("failed to buffer marks err={s}", .{@errorName(err)});
+                    };
                 }
             }
         }
@@ -3075,7 +3123,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                             try daemon.handleSnapshot(&term);
                             break :daemon_loop;
                         },
-                        .Mark => try daemon.handleMark(msg.payload),
+                        .Mark => try daemon.handleMark(msg.payload, &vt_stream),
                         _ => std.log.warn(
                             "ignoring unknown IPC tag={d}",
                             .{@intFromEnum(msg.header.tag)},
