@@ -544,6 +544,9 @@ const Client = struct {
     alloc: std.mem.Allocator,
     socket_fd: i32,
     has_pending_output: bool = false,
+    /// Set when the client sends `.Init`: a real terminal is attached. A
+    /// client that only reads output (`zmx tail`, a passive watcher) is not.
+    is_terminal: bool = false,
     read_buf: ipc.SocketBuffer,
     write_buf: std.ArrayList(u8),
 
@@ -709,6 +712,53 @@ test "parseAttachArgs errors on missing --restore-from value" {
     try std.testing.expectError(error.MissingRestoreFromValue, parseAttachArgs(alloc, &it));
 }
 
+fn testClient(alloc: std.mem.Allocator, is_terminal: bool) !*Client {
+    const client = try alloc.create(Client);
+    client.* = .{
+        .alloc = alloc,
+        .socket_fd = try posix.dup(1),
+        .is_terminal = is_terminal,
+        .read_buf = try ipc.SocketBuffer.init(alloc),
+        .write_buf = .empty,
+    };
+    return client;
+}
+
+test "has_terminal_client follows terminal clients, not passive ones" {
+    const alloc = std.testing.allocator;
+    var cfg: Cfg = undefined;
+    var daemon = Daemon{
+        .running = true,
+        .cfg = &cfg,
+        .alloc = alloc,
+        .clients = .empty,
+        .session_name = "test",
+        .socket_path = "",
+        .pid = 0,
+        .created_at = 0,
+        .leader_client_fd = null,
+        .has_terminal_client = true,
+    };
+    defer daemon.clients.deinit(alloc);
+    try daemon.clients.append(alloc, try testClient(alloc, false));
+    try daemon.clients.append(alloc, try testClient(alloc, true));
+
+    // The terminal detaches; the passive client stays.
+    _ = daemon.closeClient(daemon.clients.items[1], 1, false);
+    try std.testing.expect(!daemon.has_terminal_client);
+    try std.testing.expectEqual(@as(usize, 1), daemon.clients.items.len);
+
+    try daemon.clients.append(alloc, try testClient(alloc, true));
+    daemon.refreshTerminalClient();
+    try std.testing.expect(daemon.has_terminal_client);
+    // The passive client leaves; the terminal is still there.
+    _ = daemon.closeClient(daemon.clients.items[0], 0, false);
+    try std.testing.expect(daemon.has_terminal_client);
+
+    daemon.handleDetachAll();
+    try std.testing.expect(!daemon.has_terminal_client);
+}
+
 /// Daemon is responsible for managing a zmx session.
 ///
 /// It holds all the state for a running session.  Instead of a single daemon for all sessions, we
@@ -784,12 +834,28 @@ const Daemon = struct {
         client.deinit();
         self.alloc.destroy(client);
         _ = self.clients.orderedRemove(i);
+        self.refreshTerminalClient();
         std.log.info("client disconnected fd={d} remaining={d}", .{ fd, self.clients.items.len });
         if (shutdown_on_last and self.clients.items.len == 0) {
             self.shutdown();
             return true;
         }
         return false;
+    }
+
+    /// Recompute `has_terminal_client` after a client leaves. When the last
+    /// terminal detaches, the daemon answers terminal queries (DA1, the
+    /// OSC 7501 support query) again, even while passive clients stay
+    /// connected. Otherwise a program started after the detach waits for
+    /// an answer that never comes.
+    pub fn refreshTerminalClient(self: *Daemon) void {
+        for (self.clients.items) |c| {
+            if (c.is_terminal) {
+                self.has_terminal_client = true;
+                return;
+            }
+        }
+        self.has_terminal_client = false;
     }
 
     fn setLeader(self: *Daemon, client: *Client) !void {
@@ -1083,6 +1149,8 @@ const Daemon = struct {
         payload: []const u8,
     ) !void {
         if (payload.len != @sizeOf(ipc.Resize)) return;
+        client.is_terminal = true;
+        self.has_terminal_client = true;
 
         // Serialize terminal state BEFORE resize to capture correct cursor position.
         // Resizing triggers reflow which can move the cursor, and the shell's
@@ -1201,6 +1269,7 @@ const Daemon = struct {
             self.alloc.destroy(client_to_close);
         }
         self.clients.clearRetainingCapacity();
+        self.has_terminal_client = false;
     }
 
     pub fn handleKill(self: *Daemon) void {
