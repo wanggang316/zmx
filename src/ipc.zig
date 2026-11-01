@@ -19,6 +19,11 @@ pub const Tag = enum(u8) {
     Write = 12,
     TaskComplete = 13,
     Snapshot = 14,
+    /// Broadcast the payload to every client as an `.Output` frame, at its
+    /// place in the PTY output stream. Neither the terminal mirror nor the
+    /// child sees it. A host uses it as a fence: two clients that both read
+    /// it know they have read the same output before it.
+    Mark = 15,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
     // @enumFromInt, so out-of-range values (15-255) are representable
     // rather than UB. Switches must handle `_` (unknown tag).
@@ -266,7 +271,7 @@ test "Tag wire values are frozen" {
         .{ Tag.Info, 6 },   .{ Tag.Init, 7 },          .{ Tag.History, 8 },
         .{ Tag.Run, 9 },    .{ Tag.Ack, 10 },          .{ Tag.Switch, 11 },
         .{ Tag.Write, 12 }, .{ Tag.TaskComplete, 13 },
-        .{ Tag.Snapshot, 14 },
+        .{ Tag.Snapshot, 14 }, .{ Tag.Mark, 15 },
     }) |p| try std.testing.expectEqual(@as(u8, p[1]), @intFromEnum(p[0]));
 }
 

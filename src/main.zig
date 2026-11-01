@@ -724,6 +724,41 @@ fn testClient(alloc: std.mem.Allocator, is_terminal: bool) !*Client {
     return client;
 }
 
+test "handleMark sends the payload to every client as output" {
+    const alloc = std.testing.allocator;
+    var cfg: Cfg = undefined;
+    var daemon = Daemon{
+        .running = true,
+        .cfg = &cfg,
+        .alloc = alloc,
+        .clients = .empty,
+        .session_name = "test",
+        .socket_path = "",
+        .pid = 0,
+        .created_at = 0,
+        .leader_client_fd = null,
+    };
+    defer {
+        for (daemon.clients.items) |c| {
+            c.deinit();
+            alloc.destroy(c);
+        }
+        daemon.clients.deinit(alloc);
+    }
+    try daemon.clients.append(alloc, try testClient(alloc, false));
+    try daemon.clients.append(alloc, try testClient(alloc, true));
+
+    try daemon.handleMark("fence");
+
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(alloc);
+    try ipc.appendMessage(alloc, &expected, .Output, "fence");
+    for (daemon.clients.items) |c| {
+        try std.testing.expectEqualSlices(u8, expected.items, c.write_buf.items);
+        try std.testing.expect(c.has_pending_output);
+    }
+}
+
 test "has_terminal_client follows terminal clients, not passive ones" {
     const alloc = std.testing.allocator;
     var cfg: Cfg = undefined;
@@ -1396,6 +1431,17 @@ const Daemon = struct {
         client.has_pending_output = true;
         self.has_had_client = true;
         std.log.debug("run command len={d}", .{payload.len});
+    }
+
+    /// `.Mark`: send `payload` to every client as output, in stream order.
+    /// Unlike `handleOutput`, it does not feed the terminal mirror (so it
+    /// never reaches a snapshot or a re-attach replay) and does not send
+    /// SIGWINCH to the child.
+    pub fn handleMark(self: *Daemon, payload: []const u8) !void {
+        for (self.clients.items) |client| {
+            try ipc.appendMessage(self.alloc, &client.write_buf, .Output, payload);
+            client.has_pending_output = true;
+        }
     }
 
     pub fn handleOutput(self: *Daemon, payload: []const u8, vt_stream: anytype) !void {
@@ -3029,6 +3075,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                             try daemon.handleSnapshot(&term);
                             break :daemon_loop;
                         },
+                        .Mark => try daemon.handleMark(msg.payload),
                         _ => std.log.warn(
                             "ignoring unknown IPC tag={d}",
                             .{@intFromEnum(msg.header.tag)},
