@@ -766,6 +766,80 @@ test "has_terminal_client follows terminal clients, not passive ones" {
     try std.testing.expect(!daemon.has_terminal_client);
 }
 
+/// Feeds `pty_output` to a session that had a client before, attaches a
+/// terminal client next to a passive one, and returns what each received.
+fn testReattach(alloc: std.mem.Allocator, pty_output: []const u8) !struct { terminal: []u8, passive: []u8 } {
+    var term = try ghostty_vt.Terminal.init(alloc, .{ .cols = 80, .rows = 24 });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice(pty_output);
+
+    var cfg: Cfg = undefined;
+    var daemon = Daemon{
+        .running = true,
+        .cfg = &cfg,
+        .alloc = alloc,
+        .clients = .empty,
+        .session_name = "test",
+        .socket_path = "",
+        .pid = 0,
+        .created_at = 0,
+        .leader_client_fd = null,
+        .has_pty_output = true,
+        .has_had_client = true,
+    };
+    defer daemon.clients.deinit(alloc);
+    defer while (daemon.clients.items.len > 0) {
+        _ = daemon.closeClient(daemon.clients.items[0], 0, false);
+    };
+    try daemon.clients.append(alloc, try testClient(alloc, false));
+    try daemon.clients.append(alloc, try testClient(alloc, false));
+    const passive = daemon.clients.items[0];
+    const terminal = daemon.clients.items[1];
+
+    const size = ipc.Resize{ .rows = 24, .cols = 80 };
+    try daemon.handleInit(terminal, -1, &term, std.mem.asBytes(&size));
+
+    const terminal_out = try alloc.dupe(u8, terminal.write_buf.items);
+    errdefer alloc.free(terminal_out);
+    return .{ .terminal = terminal_out, .passive = try alloc.dupe(u8, passive.write_buf.items) };
+}
+
+test "attach replays the last title after the terminal state" {
+    const alloc = std.testing.allocator;
+    const out = try testReattach(alloc, "\x1b]0;old\x07\x1b]2;Claude Code\x07$ ready");
+    defer alloc.free(out.terminal);
+    defer alloc.free(out.passive);
+
+    const state_at = std.mem.indexOf(u8, out.terminal, "$ ready") orelse return error.StateNotReplayed;
+    const title_at = std.mem.indexOf(u8, out.terminal, "\x1b]2;Claude Code\x1b\\") orelse return error.TitleNotReplayed;
+    try std.testing.expect(state_at < title_at);
+    try std.testing.expect(std.mem.indexOf(u8, out.terminal, "old") == null);
+    // A passive watcher never sent .Init, so it gets no replay.
+    try std.testing.expect(std.mem.indexOf(u8, out.passive, "Claude Code") == null);
+}
+
+test "attach replays no title after an empty title" {
+    const alloc = std.testing.allocator;
+    const out = try testReattach(alloc, "\x1b]2;Claude Code\x07\x1b]2;\x07$ ");
+    defer alloc.free(out.terminal);
+    defer alloc.free(out.passive);
+
+    try std.testing.expect(std.mem.indexOf(u8, out.terminal, "\x1b]2;") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.terminal, "Claude Code") == null);
+}
+
+test "attach replays no title when no title was set" {
+    const alloc = std.testing.allocator;
+    const out = try testReattach(alloc, "$ ready");
+    defer alloc.free(out.terminal);
+    defer alloc.free(out.passive);
+
+    try std.testing.expect(std.mem.indexOf(u8, out.terminal, "$ ready") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.terminal, "\x1b]2;") == null);
+}
+
 /// Daemon is responsible for managing a zmx session.
 ///
 /// It holds all the state for a running session.  Instead of a single daemon for all sessions, we
@@ -1242,6 +1316,18 @@ const Daemon = struct {
                         "failed to buffer terminal state for client err={s}",
                         .{@errorName(err)},
                     );
+                };
+                client.has_pending_output = true;
+            }
+            // The terminal state does not carry the OSC 0/2 title. The daemon
+            // saw all output while no client was attached, so its title is
+            // current; replay it after the state so the client shows it now
+            // and not only when the program sets it again.
+            if (term.getTitle()) |title| {
+                const seq = try std.fmt.allocPrint(self.alloc, "\x1b]2;{s}\x1b\\", .{title});
+                defer self.alloc.free(seq);
+                ipc.appendMessage(self.alloc, &client.write_buf, .Output, seq) catch |err| {
+                    std.log.warn("failed to buffer title for client err={s}", .{@errorName(err)});
                 };
                 client.has_pending_output = true;
             }
