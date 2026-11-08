@@ -768,12 +768,11 @@ test "has_terminal_client follows terminal clients, not passive ones" {
 
 /// Feeds `pty_output` to a session that had a client before, attaches a
 /// terminal client next to a passive one, and returns what each received.
-fn testReattach(alloc: std.mem.Allocator, pty_output: []const u8) !struct { terminal: []u8, passive: []u8 } {
+fn testReattach(alloc: std.mem.Allocator, pty_chunks: []const []const u8) !struct { terminal: []u8, passive: []u8 } {
     var term = try ghostty_vt.Terminal.init(alloc, .{ .cols = 80, .rows = 24 });
     defer term.deinit(alloc);
     var stream = term.vtStream();
     defer stream.deinit();
-    stream.nextSlice(pty_output);
 
     var cfg: Cfg = undefined;
     var daemon = Daemon{
@@ -790,9 +789,15 @@ fn testReattach(alloc: std.mem.Allocator, pty_output: []const u8) !struct { term
         .has_had_client = true,
     };
     defer daemon.clients.deinit(alloc);
+    defer if (daemon.last_title) |title| alloc.free(title);
     defer while (daemon.clients.items.len > 0) {
         _ = daemon.closeClient(daemon.clients.items[0], 0, false);
     };
+    // One chunk per PTY read, as the daemon loop sees them.
+    for (pty_chunks) |chunk| {
+        stream.nextSlice(chunk);
+        daemon.noteTitle(&term);
+    }
     try daemon.clients.append(alloc, try testClient(alloc, false));
     try daemon.clients.append(alloc, try testClient(alloc, false));
     const passive = daemon.clients.items[0];
@@ -808,7 +813,7 @@ fn testReattach(alloc: std.mem.Allocator, pty_output: []const u8) !struct { term
 
 test "attach replays the last title after the terminal state" {
     const alloc = std.testing.allocator;
-    const out = try testReattach(alloc, "\x1b]0;old\x07\x1b]2;Claude Code\x07$ ready");
+    const out = try testReattach(alloc, &.{"\x1b]0;old\x07\x1b]2;Claude Code\x07$ ready"});
     defer alloc.free(out.terminal);
     defer alloc.free(out.passive);
 
@@ -820,19 +825,28 @@ test "attach replays the last title after the terminal state" {
     try std.testing.expect(std.mem.indexOf(u8, out.passive, "Claude Code") == null);
 }
 
-test "attach replays no title after an empty title" {
+test "attach replays the last title after an empty title" {
     const alloc = std.testing.allocator;
-    const out = try testReattach(alloc, "\x1b]2;Claude Code\x07\x1b]2;\x07$ ");
+    const out = try testReattach(alloc, &.{ "\x1b]2;make test\x07", "\x1b]2;\x07$ " });
     defer alloc.free(out.terminal);
     defer alloc.free(out.passive);
 
-    try std.testing.expect(std.mem.indexOf(u8, out.terminal, "\x1b]2;") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out.terminal, "Claude Code") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.terminal, "\x1b]2;make test\x1b\\") != null);
+}
+
+test "attach replays the newest title after an empty title and a new title" {
+    const alloc = std.testing.allocator;
+    const out = try testReattach(alloc, &.{ "\x1b]2;old\x07", "\x1b]2;\x07", "\x1b]2;vim\x07$ " });
+    defer alloc.free(out.terminal);
+    defer alloc.free(out.passive);
+
+    try std.testing.expect(std.mem.indexOf(u8, out.terminal, "\x1b]2;vim\x1b\\") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.terminal, "old") == null);
 }
 
 test "attach replays no title when no title was set" {
     const alloc = std.testing.allocator;
-    const out = try testReattach(alloc, "$ ready");
+    const out = try testReattach(alloc, &.{"$ ready"});
     defer alloc.free(out.terminal);
     defer alloc.free(out.passive);
 
@@ -878,6 +892,10 @@ const Daemon = struct {
     // daemon feeds it into the VT mirror before entering the poll loop so
     // restored screen contents are visible before the shell's first echo.
     restore_from: ?[]const u8 = null,
+    // Last non-empty OSC 0/2 title of the session, owned. The terminal drops
+    // its title on an empty OSC 0/2, but an empty title must not erase the
+    // title a client shows (shells clear it while a command runs).
+    last_title: ?[]u8 = null,
 
     const EnsureSessionResult = struct {
         created: bool,
@@ -892,6 +910,24 @@ const Daemon = struct {
         self.clients.deinit(self.alloc);
         self.pty_write_buf.deinit(self.alloc);
         self.alloc.free(self.socket_path);
+        if (self.last_title) |title| self.alloc.free(title);
+    }
+
+    /// Records the terminal's title after output was fed to it. An empty
+    /// title leaves the last non-empty one. A title set and cleared inside
+    /// one chunk is not seen; it was never shown either.
+    pub fn noteTitle(self: *Daemon, term: *ghostty_vt.Terminal) void {
+        const title = term.getTitle() orelse return;
+        if (title.len == 0) return;
+        if (self.last_title) |last| {
+            if (std.mem.eql(u8, last, title)) return;
+        }
+        const copy = self.alloc.dupe(u8, title) catch |err| {
+            std.log.warn("failed to keep title err={s}", .{@errorName(err)});
+            return;
+        };
+        if (self.last_title) |last| self.alloc.free(last);
+        self.last_title = copy;
     }
 
     pub fn shutdown(self: *Daemon) void {
@@ -1322,8 +1358,9 @@ const Daemon = struct {
             // The terminal state does not carry the OSC 0/2 title. The daemon
             // saw all output while no client was attached, so its title is
             // current; replay it after the state so the client shows it now
-            // and not only when the program sets it again.
-            if (term.getTitle()) |title| {
+            // and not only when the program sets it again. An empty title
+            // does not erase it (see `last_title`).
+            if (self.last_title) |title| {
                 const seq = try std.fmt.allocPrint(self.alloc, "\x1b]2;{s}\x1b\\", .{title});
                 defer self.alloc.free(seq);
                 ipc.appendMessage(self.alloc, &client.write_buf, .Output, seq) catch |err| {
@@ -3033,6 +3070,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                 defer daemon.alloc.free(bytes);
                 if (bytes.len > 0) {
                     vt_stream.nextSlice(bytes);
+                    daemon.noteTitle(&term);
                     daemon.has_pty_output = true;
                     std.log.info("restore-from applied path={s}", .{path});
                 }
@@ -3130,6 +3168,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                 } else {
                     // Feed PTY output to terminal emulator for state tracking
                     vt_stream.nextSlice(buf[0..n]);
+                    daemon.noteTitle(&term);
                     daemon.has_pty_output = true;
 
                     // When no real terminal client has attached yet, respond to
@@ -3231,7 +3270,10 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                 while (client.read_buf.next()) |msg| {
                     switch (msg.header.tag) {
                         .Input => try daemon.handleInput(client, msg.payload),
-                        .Output => try daemon.handleOutput(msg.payload, &vt_stream),
+                        .Output => {
+                            try daemon.handleOutput(msg.payload, &vt_stream);
+                            daemon.noteTitle(&term);
+                        },
                         .Init => try daemon.handleInit(client, pty_fd, &term, msg.payload),
                         .Switch => try daemon.handleSwitch(msg.payload),
                         .Resize => try daemon.handleResize(client, pty_fd, &term, msg.payload),

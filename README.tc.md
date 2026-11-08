@@ -29,11 +29,15 @@ without a terminal, and keep pane state correct across a detach.
 - `fix(daemon): close every inherited descriptor, not only the first 64`
 - `feat(daemon): answer the OSC 7501 support query while detached`
 - `fix(daemon): answer terminal queries again once every terminal detached`
-- `feat(daemon): replay the OSC 0/2 title on attach` — the daemon's terminal
-  keeps the last OSC 0/2 title (an empty title clears it). On a re-attach,
-  `handleInit` sends it as `OSC 2` after the serialized terminal state, only
-  to a client that sent `.Init`. A pane then shows the program's title at
-  once after an app restart. See codans ADR 0009, decision 8.
+- `feat(daemon): replay the OSC 0/2 title on attach` — the daemon keeps the
+  last non-empty OSC 0/2 title (`Daemon.last_title`; an empty title does not
+  erase it, ADR 0009 decision 4). On a re-attach, `handleInit` sends it as
+  `OSC 2` after the serialized terminal state, only to a client that sent
+  `.Init`. A pane then shows the program's title at once after an app
+  restart. See codans ADR 0009, decision 8.
+- `fix(daemon): keep the last non-empty title across an empty title` —
+  follow-up to the patch above: the terminal drops its title on an empty
+  OSC 0/2, so the daemon records the title after each PTY chunk instead.
 
 ## Upgrading
 
