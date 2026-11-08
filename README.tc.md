@@ -37,7 +37,9 @@ without a terminal, and keep pane state correct across a detach.
   restart. See codans ADR 0009, decision 8.
 - `fix(daemon): keep the last non-empty title across an empty title` —
   follow-up to the patch above: the terminal drops its title on an empty
-  OSC 0/2, so the daemon records the title after each PTY chunk instead.
+  OSC 0/2, so the daemon records each non-empty title as it is parsed,
+  through the stream's `title_changed` effect (`VtStream`). A title that one
+  PTY read sets and clears is still kept.
 
 ## Upgrading
 

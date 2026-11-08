@@ -771,8 +771,6 @@ test "has_terminal_client follows terminal clients, not passive ones" {
 fn testReattach(alloc: std.mem.Allocator, pty_chunks: []const []const u8) !struct { terminal: []u8, passive: []u8 } {
     var term = try ghostty_vt.Terminal.init(alloc, .{ .cols = 80, .rows = 24 });
     defer term.deinit(alloc);
-    var stream = term.vtStream();
-    defer stream.deinit();
 
     var cfg: Cfg = undefined;
     var daemon = Daemon{
@@ -793,11 +791,11 @@ fn testReattach(alloc: std.mem.Allocator, pty_chunks: []const []const u8) !struc
     defer while (daemon.clients.items.len > 0) {
         _ = daemon.closeClient(daemon.clients.items[0], 0, false);
     };
+    var vt: VtStream = undefined;
+    vt.init(&daemon, &term);
+    defer vt.stream.deinit();
     // One chunk per PTY read, as the daemon loop sees them.
-    for (pty_chunks) |chunk| {
-        stream.nextSlice(chunk);
-        daemon.noteTitle(&term);
-    }
+    for (pty_chunks) |chunk| vt.stream.nextSlice(chunk);
     try daemon.clients.append(alloc, try testClient(alloc, false));
     try daemon.clients.append(alloc, try testClient(alloc, false));
     const passive = daemon.clients.items[0];
@@ -828,6 +826,15 @@ test "attach replays the last title after the terminal state" {
 test "attach replays the last title after an empty title" {
     const alloc = std.testing.allocator;
     const out = try testReattach(alloc, &.{ "\x1b]2;make test\x07", "\x1b]2;\x07$ " });
+    defer alloc.free(out.terminal);
+    defer alloc.free(out.passive);
+
+    try std.testing.expect(std.mem.indexOf(u8, out.terminal, "\x1b]2;make test\x1b\\") != null);
+}
+
+test "attach replays a title cleared in the same PTY read" {
+    const alloc = std.testing.allocator;
+    const out = try testReattach(alloc, &.{"\x1b]2;make test\x07\x1b]2;\x07$ "});
     defer alloc.free(out.terminal);
     defer alloc.free(out.passive);
 
@@ -913,9 +920,8 @@ const Daemon = struct {
         if (self.last_title) |title| self.alloc.free(title);
     }
 
-    /// Records the terminal's title after output was fed to it. An empty
-    /// title leaves the last non-empty one. A title set and cleared inside
-    /// one chunk is not seen; it was never shown either.
+    /// Records the terminal's title when an OSC 0/2 sets it (`VtStream`). An
+    /// empty title leaves the last non-empty one.
     pub fn noteTitle(self: *Daemon, term: *ghostty_vt.Terminal) void {
         const title = term.getTitle() orelse return;
         if (title.len == 0) return;
@@ -3038,6 +3044,29 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
 
 /// dameonLoop is what the daemon runs to send and receive ipc commands from its corresponding
 /// clients.  It uses poll() as its non-blocking mechanism.
+/// The daemon's VT stream with a pointer back to the daemon. The stream's
+/// `title_changed` effect gets only the handler; from it, the daemon records
+/// every title as it is parsed. A title that one PTY read sets and then
+/// clears is still recorded: clients received it and keep it.
+const VtStream = struct {
+    const Stream = @TypeOf(@as(*ghostty_vt.Terminal, undefined).vtStream());
+
+    daemon: *Daemon,
+    stream: Stream,
+
+    /// Wires the title effect. `self` must not move afterwards.
+    fn init(self: *VtStream, daemon: *Daemon, term: *ghostty_vt.Terminal) void {
+        self.* = .{ .daemon = daemon, .stream = term.vtStream() };
+        self.stream.handler.effects.title_changed = &titleChanged;
+    }
+
+    fn titleChanged(handler: *Stream.Handler) void {
+        const stream: *Stream = @fieldParentPtr("handler", handler);
+        const self: *VtStream = @fieldParentPtr("stream", stream);
+        self.daemon.noteTitle(handler.terminal);
+    }
+};
+
 fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
     std.log.info("daemon started session={s} pty_fd={d}", .{ daemon.session_name, pty_fd });
     daemon.pty_fd = pty_fd;
@@ -3053,8 +3082,10 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
         .max_scrollback = daemon.cfg.max_scrollback,
     });
     defer term.deinit(daemon.alloc);
-    var vt_stream = term.vtStream();
-    defer vt_stream.deinit();
+    var vt: VtStream = undefined;
+    vt.init(daemon, &term);
+    defer vt.stream.deinit();
+    const vt_stream = &vt.stream;
 
     // Pre-fill the VT mirror from a snapshot file before any PTY bytes are
     // read. Done here (not in spawnPty) because vt_stream isn't constructed
@@ -3070,7 +3101,6 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                 defer daemon.alloc.free(bytes);
                 if (bytes.len > 0) {
                     vt_stream.nextSlice(bytes);
-                    daemon.noteTitle(&term);
                     daemon.has_pty_output = true;
                     std.log.info("restore-from applied path={s}", .{path});
                 }
@@ -3168,7 +3198,6 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                 } else {
                     // Feed PTY output to terminal emulator for state tracking
                     vt_stream.nextSlice(buf[0..n]);
-                    daemon.noteTitle(&term);
                     daemon.has_pty_output = true;
 
                     // When no real terminal client has attached yet, respond to
@@ -3270,10 +3299,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                 while (client.read_buf.next()) |msg| {
                     switch (msg.header.tag) {
                         .Input => try daemon.handleInput(client, msg.payload),
-                        .Output => {
-                            try daemon.handleOutput(msg.payload, &vt_stream);
-                            daemon.noteTitle(&term);
-                        },
+                        .Output => try daemon.handleOutput(msg.payload, vt_stream),
                         .Init => try daemon.handleInit(client, pty_fd, &term, msg.payload),
                         .Switch => try daemon.handleSwitch(msg.payload),
                         .Resize => try daemon.handleResize(client, pty_fd, &term, msg.payload),
