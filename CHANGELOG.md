@@ -10,6 +10,7 @@ Use spec: https://common-changelog.org/
   - An observer gets a size-stamped snapshot with capped scrollback, the live output stream, and a resize notice at the exact stream position of every PTY resize
   - An observer never becomes leader, never resizes the PTY and never writes to it
 - `test/observer.bats` integration suite
+- On a re-attach, the daemon sends the session's last OSC 0/2 title to the terminal client, after the terminal state
 
 ### Fixed
 
